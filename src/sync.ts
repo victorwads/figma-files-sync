@@ -1,3 +1,4 @@
+import { concurrencyLimit, forEachConcurrent } from "./concurrency.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { copyFile, rename, unlink, readdir } from "node:fs/promises";
@@ -87,6 +88,7 @@ export class FigmaSync {
   private apiInstance?: FigmaApi;
   private readonly downloader: NativeDownloader;
   constructor(private readonly options: ClientOptions = {}) {
+    concurrencyLimit(options.concurrency);
     this.auth = new AuthStore(options.authDirectory);
     this.apiInstance = options.api;
     this.downloader =
@@ -325,116 +327,119 @@ export class FigmaSync {
           const selectedFiles = manifest.files.filter(
             (file) => !onlyKey || file.key === onlyKey,
           );
-          let fileIndex = 0;
-          for (const file of selectedFiles) {
-            fileIndex++;
-            this.options.onProgress?.({
-              phase: "file",
-              message:
-                "Checking file " +
-                fileIndex +
-                "/" +
-                selectedFiles.length +
-                " in " +
-                directory +
-                ": " +
-                file.localPath,
-            });
-            if (onlyKey && file.key !== onlyKey) continue;
-            const item = {
-              directory,
-              key: file.key,
-              localPath: file.localPath,
-            };
-            try {
-              let meta: FileMetadata;
-              try {
-                meta = await api.file(file.key);
-              } catch (error) {
-                if (
-                  error instanceof FigmaApiError &&
-                  [403, 404].includes(error.status)
-                ) {
-                  file.remote = {
-                    ...file.remote,
-                    version: file.remote?.version ?? null,
-                    modifiedAt: file.remote?.modifiedAt ?? null,
-                    checkedAt: new Date().toISOString(),
-                    availability: "unavailable",
-                    ...(file.remote?.membership
-                      ? { membership: file.remote.membership }
-                      : {}),
-                  };
-                  emit({
-                    ...item,
-                    status: "unavailable",
-                    message: error.message,
-                  });
-                  continue;
-                }
-                throw error;
-              }
-              const membership = file.remote?.membership;
-              file.remote = {
-                ...file.remote,
-                ...this.remote(meta),
-                ...(membership ? { membership } : {}),
-              };
-              file.name = meta.name;
-              if (meta.editorType !== "figma") {
-                emit({
-                  ...item,
-                  status: "unsupported",
-                  message: "Only Figma Design is supported.",
-                });
-                continue;
-              }
-              const target = path.join(directory, file.localPath);
-              const local = await hashFile(target);
-              const status = planFile(file, local);
-              if (
-                !download ||
-                status === "unchanged" ||
-                status === "unavailable" ||
-                (status === "conflict" && !options.force)
-              ) {
-                emit({ ...item, status });
-                continue;
-              }
-              await saveManifest(directory, manifest);
+          await forEachConcurrent(
+            selectedFiles,
+            download ? concurrencyLimit(this.options.concurrency) : 1,
+            async (file, index) => {
+              const fileIndex = index + 1;
               this.options.onProgress?.({
-                phase: "download",
+                phase: "file",
                 message:
-                  "Downloading file " +
+                  "Checking file " +
                   fileIndex +
                   "/" +
                   selectedFiles.length +
                   " in " +
                   directory +
                   ": " +
-                  file.localPath +
-                  " (" +
-                  status +
-                  ")",
+                  file.localPath,
               });
-              await this.downloadFile(
-                api,
+              if (onlyKey && file.key !== onlyKey) return;
+              const item = {
                 directory,
-                manifest,
-                file,
-                local,
-                !!options.force,
-              );
-              emit({ ...item, status: "downloaded" });
-            } catch (error) {
-              const message =
-                error instanceof Error ? error.message : "Operation failed";
-              result.errors.push(file.key + ": " + message);
-              emit({ ...item, status: "error", message });
-            } finally {
-              await saveManifest(directory, manifest);
-            }
-          }
+                key: file.key,
+                localPath: file.localPath,
+              };
+              try {
+                let meta: FileMetadata;
+                try {
+                  meta = await api.file(file.key);
+                } catch (error) {
+                  if (
+                    error instanceof FigmaApiError &&
+                    [403, 404].includes(error.status)
+                  ) {
+                    file.remote = {
+                      ...file.remote,
+                      version: file.remote?.version ?? null,
+                      modifiedAt: file.remote?.modifiedAt ?? null,
+                      checkedAt: new Date().toISOString(),
+                      availability: "unavailable",
+                      ...(file.remote?.membership
+                        ? { membership: file.remote.membership }
+                        : {}),
+                    };
+                    emit({
+                      ...item,
+                      status: "unavailable",
+                      message: error.message,
+                    });
+                    return;
+                  }
+                  throw error;
+                }
+                const membership = file.remote?.membership;
+                file.remote = {
+                  ...file.remote,
+                  ...this.remote(meta),
+                  ...(membership ? { membership } : {}),
+                };
+                file.name = meta.name;
+                if (meta.editorType !== "figma") {
+                  emit({
+                    ...item,
+                    status: "unsupported",
+                    message: "Only Figma Design is supported.",
+                  });
+                  return;
+                }
+                const target = path.join(directory, file.localPath);
+                const local = await hashFile(target);
+                const status = planFile(file, local);
+                if (
+                  !download ||
+                  status === "unchanged" ||
+                  status === "unavailable" ||
+                  (status === "conflict" && !options.force)
+                ) {
+                  emit({ ...item, status });
+                  return;
+                }
+                await saveManifest(directory, manifest);
+                this.options.onProgress?.({
+                  phase: "download",
+                  message:
+                    "Downloading file " +
+                    fileIndex +
+                    "/" +
+                    selectedFiles.length +
+                    " in " +
+                    directory +
+                    ": " +
+                    file.localPath +
+                    " (" +
+                    status +
+                    ")",
+                });
+                await this.downloadFile(
+                  api,
+                  directory,
+                  manifest,
+                  file,
+                  local,
+                  !!options.force,
+                );
+                emit({ ...item, status: "downloaded" });
+              } catch (error) {
+                const message =
+                  error instanceof Error ? error.message : "Operation failed";
+                result.errors.push(file.key + ": " + message);
+                emit({ ...item, status: "error", message });
+              } finally {
+                await saveManifest(directory, manifest);
+              }
+            },
+          );
         });
       } catch (error) {
         result.errors.push(

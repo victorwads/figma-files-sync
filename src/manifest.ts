@@ -190,6 +190,7 @@ export async function atomicWrite(
     });
   }
 }
+const manifestWrites = new Map<string, Promise<void>>();
 export async function saveManifest(
   directory: string,
   manifest: Manifest,
@@ -197,8 +198,20 @@ export async function saveManifest(
   manifestSchema.parse(manifest);
   const file = path.join(directory, MANIFEST_NAME);
   const content = JSON.stringify(manifest, null, 2) + "\n";
-  if ((await readFile(file, "utf8")) !== content)
-    await atomicWrite(file, content);
+  const key = path.resolve(file);
+  const previous = manifestWrites.get(key) ?? Promise.resolve();
+  const write = previous
+    .catch(() => {})
+    .then(async () => {
+      if ((await readFile(file, "utf8")) !== content)
+        await atomicWrite(file, content);
+    });
+  manifestWrites.set(key, write);
+  try {
+    await write;
+  } finally {
+    if (manifestWrites.get(key) === write) manifestWrites.delete(key);
+  }
 }
 export async function withManifest<T>(
   directory: string,

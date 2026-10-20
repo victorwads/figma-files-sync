@@ -11,6 +11,7 @@ import { RestFigmaApi } from "./api.js";
 import { createFigmaSync, type SyncResult } from "./sync.js";
 import { ensureManifest } from "./manifest.js";
 import { createProgressLogger } from "./progress.js";
+import { concurrencyLimit } from "./concurrency.js";
 
 function positiveNumber(value: string): number {
   const n = Number(value);
@@ -83,6 +84,12 @@ program
   .option("--headed", "Show the download browser")
   .option("--no-headless", "Show Chromium (alias for --headed)")
   .option(
+    "--concurrency <tabs>",
+    "Active download tabs in one Chromium (1–3; default 1)",
+    (value) => concurrencyLimit(Number(value)),
+    1,
+  )
+  .option(
     "--timeout <seconds>",
     "Editor/download timeout",
     positiveNumber,
@@ -107,6 +114,7 @@ async function execute(
   const client = createFigmaSync({
     authDirectory: opts.authDir,
     headed: opts.headed || opts.headless === false,
+    concurrency: opts.concurrency,
     onProgress: progress.report,
     onEvent: opts.json
       ? undefined

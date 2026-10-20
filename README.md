@@ -116,6 +116,7 @@ Options:
 - `sync --force` / `add --force`: back up and replace **local conflicts**. Unchanged documents are still skipped.
 - `--json`: structured results for add/fetch/sync/auth status/logout. Interactive login and browser installation are not JSON operations.
 - `--headed` or `--no-headless`: show Chromium while downloading, e.g. `figma-files-sync add <url> --no-headless`.
+- `--concurrency 2`: up to two download tabs in one Chromium; accepts 1–3, default 1.
 - `--timeout 300`: editor/download timeout in seconds.
 - `--auth-dir <directory>`: override the credential directory.
 
@@ -199,7 +200,11 @@ The npm package includes `figma-files-sync/manifest.schema.json`. Runtime valida
 - Sync compares remote version, successful-download baseline and local presence/hash.
 - Unchanged remote/local pairs cause **zero native downloads**.
 - Locally modified files become conflicts. `--force` preserves a sibling `.fig.backup-<id>` before replacing them.
-- Downloads run sequentially, with at least 10 seconds between attempts.
+- One Chromium process and one authenticated context are reused per client/CLI execution. A bounded pool reuses editor tabs; successful downloads leave the Figma editor loaded, rather than navigating to a blank page. Failed tabs are discarded without restarting the whole browser.
+- When a visible same-tab link to the next document already exists in the Figma UI, the downloader clicks it so Figma can use its own client-side navigation. Otherwise it falls back to normal document navigation in the same tab. It never fakes `pushState`, sends synthetic router events or uses undocumented router internals. **Same-tab reuse does not guarantee SPA navigation**: Figma controls how each link loads, and cross-document navigation may still reload the application. Logs distinguish these paths.
+- Downloads are sequential by default. Use `--concurrency 2` or `--concurrency 3` to overlap editor loads/transfers in separate tabs of that same browser, e.g. `figma-files-sync sync --concurrency 2 --no-headless`. Folder traversal remains sequential and metadata fetch-only runs stay sequential.
+- Editor starts are staggered by at least 10 seconds even in concurrent mode; this is not a bypass for Figma rate limits. Parallel tabs increase RAM usage and may trigger anti-automation safeguards: reduce concurrency if downloads fail.
+- Manifest and browser-session writes are serialized so concurrent workers cannot commit stale snapshots over newer ones. Directory locks remain held until all workers settle. The browser closes only when the client closes / CLI operation finishes (separate CLI invocations do not share a background browser).
 - Native downloads are staged beside the destination, checked for empty/error responses, then renamed. This is not full validation of Figma’s proprietary format.
 - Metadata checks before/after download detect concurrent remote edits and preserve the previous local file. This is best-effort, **not a transactional snapshot guarantee**.
 - Remote deletion, lost access and discovery errors never delete local copies or historical registrations.

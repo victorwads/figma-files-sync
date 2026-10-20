@@ -609,3 +609,72 @@ test("sync progress reports folder counts and file stages before downloader runs
     events.some((event) => event.message.includes("Hashing and committing")),
   );
 });
+
+test("concurrent sync overlaps two downloads without losing successful manifest entries", async (t) => {
+  const f = await fixture(t, { concurrency: 2 });
+  let active = 0,
+    max = 0;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.listings.set("123", {
+    name: "Root",
+    files: [
+      { key: "A", name: "A" },
+      { key: "B", name: "B" },
+      { key: "C", name: "C" },
+    ],
+    folders: [],
+  });
+  const original = f.downloader.download;
+  f.downloader.download = async (...args) => {
+    active++;
+    max = Math.max(max, active);
+    if (active === 2) release();
+    await gate;
+    try {
+      await original(...args);
+    } finally {
+      active--;
+    }
+  };
+  const result = await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  assert.equal(max, 2);
+  assert.deepEqual(result.errors, []);
+  const m = await readManifest(path.join(f.cwd, "root"));
+  assert.equal(m.files.length, 3);
+  assert.ok(m.files.every((file) => file.synced?.version === "1"));
+  await f.client.sync({ cwd: f.cwd });
+  assert.equal(f.downloads.length, 3);
+});
+test("parallel failures preserve other worker successes and release locks only after completion", async (t) => {
+  const f = await fixture(t, { concurrency: 3 });
+  f.listings.set("123", {
+    name: "Root",
+    files: [
+      { key: "A", name: "A" },
+      { key: "B", name: "B" },
+      { key: "C", name: "C" },
+    ],
+    folders: [],
+  });
+  const original = f.downloader.download;
+  f.downloader.download = async (key, target) => {
+    if (key === "B") throw new Error("native failed");
+    await original(key, target);
+  };
+  const result = await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  assert.equal(result.errors.length, 1);
+  const dir = path.join(f.cwd, "root");
+  const m = await readManifest(dir);
+  assert.equal(m.files.filter((file) => file.synced).length, 2);
+  assert.equal(m.files.find((file) => file.key === "B").synced, null);
+  assert.ok(!(await readdir(dir)).includes(".sync.fig.lock"));
+});

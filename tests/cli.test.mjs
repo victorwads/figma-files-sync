@@ -118,3 +118,17 @@ test("operation failures still flush progress to stderr without corrupting JSON"
   assert.match(r.stderr, /Loading Figma API credentials/);
   assert.match(r.stderr, /Listing Figma folder 123/);
 });
+
+test("concurrency accepts 1–3 tabs and rejects invalid values before work", async (t) => {
+  const f = await fixture(t);
+  for (const value of ["1", "2", "3"]) {
+    const r = f.run("fetch", "--concurrency", value, "--json");
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), { items: [], errors: [] });
+  }
+  for (const value of ["0", "4", "-1", "1.5", "abc"]) {
+    const r = f.run("sync", "--concurrency", value);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /Concurrency/);
+  }
+});
