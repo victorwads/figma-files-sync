@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
@@ -78,7 +79,11 @@ const program = new Command();
 program
   .name("figma-files-sync")
   .description("Synchronize native Figma Design files with local directories.")
-  .version("0.1.0")
+  .version(
+    JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ).version,
+  )
   .option("--json", "Print machine-readable results")
   .option("--auth-dir <path>", "Override credential directory")
   .option("--headed", "Show the download browser")

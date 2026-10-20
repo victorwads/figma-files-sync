@@ -1,6 +1,6 @@
 {
   "name": "figma-files-sync",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Keep native Figma files synchronized locally with their source documents.",
   "type": "module",
   "bin": {
@@ -26,14 +26,20 @@
     "format": "prettier --write src tests scripts README.md package.json tsconfig.json eslint.config.mjs",
     "format:check": "prettier --check src tests scripts README.md package.json tsconfig.json eslint.config.mjs",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src tests",
+    "lint": "eslint src tests scripts",
     "test": "npm run build && node --test tests/*.test.mjs",
     "check": "npm run typecheck && npm run lint && npm test",
     "prepare": "npm run build",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:package": "node scripts/test-package.mjs",
+    "prepublishOnly": "npm run check && npm run format:check && npm run test:package"
   },
   "author": "Victor Wads",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/victorwads/figma-files-sync.git"

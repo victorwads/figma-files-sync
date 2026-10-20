@@ -6,17 +6,30 @@ Keep native Figma Design files synchronized locally with their original document
 
 Standalone, with no OpenPencil dependency. Portable directory manifests let any application associate local files with their Figma sources.
 
-> Initial release: automated tests use simulated Figma responses and downloads. Native downloads depend on Figma’s web UI and still require an authorized live smoke test before relying on this as a backup. No automatic npm publication is configured.
+> Initial release: automated tests use simulated Figma responses and downloads. Native downloads depend on Figma’s web UI and still require an authorized live smoke test before relying on this as a backup. A tag-based GitHub Actions workflow supports npm Trusted Publishing (OIDC), after the one-time npm trust setup.
 
 ## Install
 
-Requires **Node.js 22.12+**. Once published:
+Requires **Node.js 22.12+**. Install globally or run via `npx`:
 
 ```sh
 npm install -g figma-files-sync
 # Or:
 npx figma-files-sync --help
 ```
+
+No global install is required for the full workflow:
+
+```sh
+mkdir my-designs
+cd my-designs
+npx figma-files-sync login
+npx figma-files-sync add "https://www.figma.com/design/FILE_KEY/Homepage"
+npx figma-files-sync fetch
+npx figma-files-sync sync
+```
+
+Login offers Chromium installation when needed. Credentials are saved in your user configuration directory and survive temporary npx installs. Use `npx figma-files-sync@latest ...` to explicitly request the latest release.
 
 ### Use the local checkout as a command
 
@@ -269,3 +282,7 @@ Before publication, perform an authorized live smoke test: login, add a small De
 ## License and acknowledgments
 
 MIT. Developed by **Victor Wads**. The project grew from [Alex Chan’s figma-export](https://github.com/alexchantastic/figma-export), retaining its history and Figma API discovery / Playwright download foundations. The original copyright and permission notice remain in LICENSE.
+
+## Publishing (maintainers)
+
+See [the release guide](https://github.com/victorwads/figma-files-sync/blob/main/docs/releasing.md) for bootstrap, npm Trusted Publisher configuration and tag-based OIDC releases. The workflow uses no long-lived npm token.

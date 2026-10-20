@@ -132,3 +132,13 @@ test("concurrency accepts 1–3 tabs and rejects invalid values before work", as
     assert.match(r.stderr, /Concurrency/);
   }
 });
+
+test("CLI version matches the published package metadata", async (t) => {
+  const f = await fixture(t);
+  const metadata = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  const result = f.run("--version");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), metadata.version);
+});
