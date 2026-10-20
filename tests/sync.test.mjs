@@ -1,0 +1,611 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  mkdtemp,
+  writeFile,
+  readFile,
+  readdir,
+  rm,
+  unlink,
+  symlink,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import {
+  createFigmaSync,
+  ensureManifest,
+  readManifest,
+  parseFigmaUrl,
+  FigmaApiError,
+  manifestSchema,
+  emptyManifest,
+  planFile,
+  RestFigmaApi,
+  AuthStore,
+} from "../dist/index.js";
+import { withManifest, allocateName } from "../dist/manifest.js";
+import { verifyNativeFile } from "../dist/download.js";
+
+const date = "2026-10-20T02:00:00Z";
+async function fixture(t, options = {}) {
+  const cwd = await mkdtemp(path.join(tmpdir(), "figma-files-sync-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const versions = new Map();
+  const listings = new Map();
+  const downloads = [];
+  const api = {
+    async file(key) {
+      const value = versions.get(key);
+      if (value instanceof Error) throw value;
+      return {
+        key,
+        name: "File " + key,
+        version: "1",
+        modifiedAt: date,
+        editorType: "figma",
+        ...value,
+      };
+    },
+    async folder(id) {
+      const value = listings.get(id);
+      if (value instanceof Error) throw value;
+      return value ?? { name: "Folder " + id, files: [], folders: [] };
+    },
+    async validateToken() {},
+  };
+  const downloader = {
+    async download(key, destination) {
+      downloads.push(key);
+      await writeFile(
+        destination,
+        "fig-kiwi content " + key + " " + (versions.get(key)?.version ?? "1"),
+      );
+    },
+    async close() {},
+  };
+  const client = createFigmaSync({ api, downloader, ...options });
+  t.after(() => client.close());
+  return { cwd, client, versions, listings, downloads, api, downloader };
+}
+
+test("empty manifest and idempotent individual add", async (t) => {
+  const f = await fixture(t);
+  assert.deepEqual(await ensureManifest(f.cwd), emptyManifest());
+  let r = await f.client.add(
+    "https://www.figma.com/design/ABC/Home?node-id=1-2",
+    { cwd: f.cwd },
+  );
+  assert.equal(r.items[0].status, "downloaded");
+  await f.client.add("https://www.figma.com/file/ABC/Home", { cwd: f.cwd });
+  assert.equal(f.downloads.length, 1);
+  const m = await readManifest(f.cwd);
+  assert.equal(m.files.length, 1);
+  assert.equal(
+    m.files[0].url,
+    "https://www.figma.com/design/ABC/Home?node-id=1-2",
+  );
+  assert.equal(m.folder, null);
+  assert.deepEqual((await readdir(f.cwd)).sort(), [
+    ".sync.fig.json",
+    "File ABC.fig",
+  ]);
+});
+test("fetch observes a new version but never marks it synchronized or downloads", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/ABC", { cwd: f.cwd });
+  f.versions.set("ABC", { version: "2" });
+  const r = await f.client.fetch({ cwd: f.cwd });
+  assert.equal(r.items[0].status, "modified");
+  assert.equal(f.downloads.length, 1);
+  let m = await readManifest(f.cwd);
+  assert.equal(m.files[0].remote.version, "2");
+  assert.equal(m.files[0].synced.version, "1");
+  await f.client.sync({ cwd: f.cwd });
+  m = await readManifest(f.cwd);
+  assert.equal(m.files[0].synced.version, "2");
+  await f.client.sync({ cwd: f.cwd });
+  assert.equal(f.downloads.length, 2);
+});
+test("missing local file downloads again", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/ABC", { cwd: f.cwd });
+  const m = await readManifest(f.cwd);
+  await unlink(path.join(f.cwd, m.files[0].localPath));
+  assert.equal(
+    (await f.client.fetch({ cwd: f.cwd })).items[0].status,
+    "missing",
+  );
+  await f.client.sync({ cwd: f.cwd });
+  assert.equal(f.downloads.length, 2);
+});
+test("local changes conflict; force preserves backup before replacement", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/ABC", { cwd: f.cwd });
+  const target = path.join(
+    f.cwd,
+    (await readManifest(f.cwd)).files[0].localPath,
+  );
+  await writeFile(target, "user changes");
+  assert.equal(
+    (await f.client.sync({ cwd: f.cwd })).items[0].status,
+    "conflict",
+  );
+  assert.equal(f.downloads.length, 1);
+  await f.client.sync({ cwd: f.cwd, force: true });
+  const backup = (await readdir(f.cwd)).find((s) => s.includes(".backup-"));
+  assert.ok(backup);
+  assert.equal(
+    await readFile(path.join(f.cwd, backup), "utf8"),
+    "user changes",
+  );
+});
+test("unavailable remote preserves existing local file and sync baseline", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/ABC", { cwd: f.cwd });
+  f.versions.set("ABC", new FigmaApiError(404, "Unavailable"));
+  const r = await f.client.sync({ cwd: f.cwd });
+  assert.equal(r.items[0].status, "unavailable");
+  const m = await readManifest(f.cwd);
+  assert.equal(m.files[0].synced.version, "1");
+  assert.equal(m.files[0].remote.availability, "unavailable");
+  assert.ok(await readFile(path.join(f.cwd, m.files[0].localPath)));
+});
+test("folder discovery merges new files and preserves disappeared entries", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Wireframes",
+    files: [{ key: "A", name: "Login" }],
+    folders: [{ id: "456", name: "Mobile" }],
+  });
+  f.listings.set("456", {
+    name: "Mobile",
+    files: [{ key: "M", name: "Mobile" }],
+    folders: [],
+  });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "wireframes",
+  });
+  const dir = path.join(f.cwd, "wireframes");
+  assert.equal((await readManifest(dir)).files.length, 1);
+  assert.equal((await readManifest(path.join(dir, "Mobile"))).files.length, 1);
+  f.listings.set("123", {
+    name: "Wireframes",
+    files: [{ key: "B", name: "Dashboard" }],
+    folders: [{ id: "456", name: "Mobile" }],
+  });
+  await f.client.fetch({ cwd: f.cwd });
+  assert.equal(f.downloads.length, 2);
+  let m = await readManifest(dir);
+  assert.equal(m.files.length, 2);
+  assert.equal(m.files[0].remote.membership, "absent");
+  assert.equal(m.files[1].synced, null);
+  await f.client.sync({ cwd: f.cwd });
+  assert.equal(f.downloads.length, 3);
+  await f.client.add("https://figma.com/files/project/123", { cwd: f.cwd });
+  m = await readManifest(dir);
+  assert.equal(m.files.length, 2);
+  assert.equal(f.downloads.length, 3);
+});
+test("partial folder discovery never erases entries or marks them removed", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Folder",
+    files: [{ key: "A", name: "A" }],
+    folders: [],
+  });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "folder",
+  });
+  const dir = path.join(f.cwd, "folder");
+  const before = await readManifest(dir);
+  f.listings.set("123", new Error("Subfolder request failed"));
+  const result = await f.client.fetch({ cwd: f.cwd });
+  assert.equal(result.errors.length, 1);
+  assert.deepEqual(await readManifest(dir), before);
+});
+test("failed downloads stay pending and preserve previously successful entries", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  f.downloader.download = async () => {
+    throw new Error("Failed download");
+  };
+  let r = await f.client.add("https://figma.com/design/B", { cwd: f.cwd });
+  assert.equal(r.errors.length, 1);
+  const m = await readManifest(f.cwd);
+  assert.equal(m.files.length, 2);
+  assert.equal(m.files[0].synced.version, "1");
+  assert.equal(m.files[1].synced, null);
+  r = await f.client.fetch({ cwd: f.cwd });
+  assert.equal(r.items.find((i) => i.key === "B").status, "new");
+});
+test("remote edit during download preserves old copy and baseline", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const target = path.join(
+    f.cwd,
+    (await readManifest(f.cwd)).files[0].localPath,
+  );
+  const old = await readFile(target, "utf8");
+  f.versions.set("A", { version: "2" });
+  f.downloader.download = async (_key, temp) => {
+    await writeFile(temp, "fig-kiwi new");
+    f.versions.set("A", { version: "3" });
+  };
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.errors.length, 1);
+  assert.equal(await readFile(target, "utf8"), old);
+  assert.equal((await readManifest(f.cwd)).files[0].synced.version, "1");
+});
+test("local edit during download is not overwritten", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const target = path.join(
+    f.cwd,
+    (await readManifest(f.cwd)).files[0].localPath,
+  );
+  f.versions.set("A", { version: "2" });
+  f.downloader.download = async (_key, temp) => {
+    await writeFile(temp, "fig-kiwi new");
+    await writeFile(target, "concurrent changes");
+  };
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.errors.length, 1);
+  assert.equal(await readFile(target, "utf8"), "concurrent changes");
+});
+test("collisions do not overwrite untracked files or duplicate names", async (t) => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.cwd, "Login.fig"), "unmanaged");
+  f.versions.set("A", { name: "Login" });
+  f.versions.set("B", { name: "LOGIN" });
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  await f.client.add("https://figma.com/design/B", { cwd: f.cwd });
+  const m = await readManifest(f.cwd);
+  assert.notEqual(
+    m.files[0].localPath.toLowerCase(),
+    m.files[1].localPath.toLowerCase(),
+  );
+  assert.equal(
+    await readFile(path.join(f.cwd, "Login.fig"), "utf8"),
+    "unmanaged",
+  );
+});
+test("remote rename keeps stable local path without download", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const previous = (await readManifest(f.cwd)).files[0].localPath;
+  f.versions.set("A", { name: "Renamed" });
+  await f.client.sync({ cwd: f.cwd });
+  const file = (await readManifest(f.cwd)).files[0];
+  assert.equal(file.name, "Renamed");
+  assert.equal(file.localPath, previous);
+  assert.equal(f.downloads.length, 1);
+});
+test("malformed manifest fails closed and is not overwritten", async (t) => {
+  const f = await fixture(t);
+  const p = path.join(f.cwd, ".sync.fig.json");
+  await writeFile(p, "{bad");
+  await assert.rejects(f.client.fetch({ cwd: f.cwd }), /Invalid/);
+  assert.equal(await readFile(p, "utf8"), "{bad");
+});
+test("future schema and duplicate identities rejected", () => {
+  assert.equal(
+    manifestSchema.safeParse({ ...emptyManifest(), schemaVersion: 2 }).success,
+    false,
+  );
+  const file = {
+    key: "A",
+    url: "https://figma.com/design/A",
+    name: "A",
+    localPath: "A.fig",
+    remote: null,
+    synced: null,
+  };
+  assert.equal(
+    manifestSchema.safeParse({ ...emptyManifest(), files: [file, file] })
+      .success,
+    false,
+  );
+  for (const localPath of ["../A.fig", "/A.fig", "CON.fig", "A\\B.fig"])
+    assert.equal(
+      manifestSchema.safeParse({
+        ...emptyManifest(),
+        files: [{ ...file, localPath }],
+      }).success,
+      false,
+    );
+});
+test("symbolic link target and manifest are refused", async (t) => {
+  const f = await fixture(t);
+  const outside = path.join(f.cwd, "outside");
+  await writeFile(outside, "unchanged");
+  await symlink(outside, path.join(f.cwd, ".sync.fig.json"));
+  await assert.rejects(ensureManifest(f.cwd), /non-regular/);
+  await unlink(path.join(f.cwd, ".sync.fig.json"));
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const p = path.join(f.cwd, (await readManifest(f.cwd)).files[0].localPath);
+  await unlink(p);
+  await symlink(outside, p);
+  assert.equal((await f.client.sync({ cwd: f.cwd })).errors.length, 1);
+  assert.equal(await readFile(outside, "utf8"), "unchanged");
+});
+test("concurrent directory lock prevents lost manifest updates", async (t) => {
+  const f = await fixture(t);
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let ready;
+  const started = new Promise((resolve) => {
+    ready = resolve;
+  });
+  const first = withManifest(f.cwd, async () => {
+    ready();
+    await gate;
+  });
+  await started;
+  await assert.rejects(
+    withManifest(f.cwd, async () => {}),
+    /locked/,
+  );
+  release();
+  await first;
+});
+test("non-design files are reported but never downloaded", async (t) => {
+  const f = await fixture(t);
+  f.versions.set("A", { editorType: "figjam" });
+  await assert.rejects(
+    f.client.add("https://figma.com/design/A", { cwd: f.cwd }),
+    /Only Figma Design/,
+  );
+  assert.equal(f.downloads.length, 0);
+});
+test("safe names handle traversal, reserved names, and case collisions", async (t) => {
+  const f = await fixture(t);
+  assert.ok(!(await allocateName(f.cwd, "../../bad", "A", [])).includes("/"));
+  assert.equal(await allocateName(f.cwd, "CON", "A", []), "Figma-CON.fig");
+});
+test("native sanity check rejects error pages but not unknown proprietary containers", async (t) => {
+  const f = await fixture(t);
+  const p = path.join(f.cwd, "candidate");
+  for (const content of ["", "  <html>Error</html>", "{bad response}"]) {
+    await writeFile(p, content);
+    await assert.rejects(verifyNativeFile(p));
+  }
+  await writeFile(p, "future-binary-format");
+  await verifyNativeFile(p);
+});
+test("URL parsing accepts supported links and rejects hostile or pinned URLs", () => {
+  assert.equal(
+    parseFigmaUrl("https://www.figma.com/files/999/project/123/Foo").id,
+    "123",
+  );
+  assert.equal(
+    parseFigmaUrl("https://figma.com/proto/ABC/Name?node-id=1-2").kind,
+    "file",
+  );
+  for (const url of [
+    "http://figma.com/design/A",
+    "https://figma.com.evil/design/A",
+    "https://user@figma.com/design/A",
+    "https://figma.com/design/A?version-id=1",
+    "https://figma.com/board/A",
+    "A",
+  ])
+    assert.throws(() => parseFigmaUrl(url));
+});
+test("plan uses versions, not numeric ordering or timestamps alone", () => {
+  const file = {
+    remote: {
+      availability: "available",
+      version: "opaque-a",
+      modifiedAt: date,
+    },
+    synced: { version: "opaque-b", modifiedAt: date, sha256: "x" },
+  };
+  assert.equal(planFile(file, { sha256: "x" }), "modified");
+  file.remote.version = "opaque-b";
+  assert.equal(planFile(file, { sha256: "x" }), "unchanged");
+});
+test("REST client uses metadata endpoint and validates payloads", async () => {
+  const calls = [];
+  const api = new RestFigmaApi("secret", async (url, init) => {
+    calls.push({ url, init });
+    return Response.json({
+      file: {
+        name: "A",
+        version: "v1",
+        last_touched_at: date,
+        editorType: "figma",
+      },
+    });
+  });
+  assert.equal((await api.file("ABC")).version, "v1");
+  assert.equal(calls[0].url, "https://api.figma.com/v1/files/ABC/meta");
+  assert.equal(calls[0].init.headers["X-FIGMA-TOKEN"], "secret");
+  await assert.rejects(
+    new RestFigmaApi("secret", async () => Response.json({})).file("A"),
+  );
+});
+test("REST errors do not expose tokens or arbitrary remote response content", async () => {
+  const api = new RestFigmaApi(
+    "private-token",
+    async () => new Response("private-token", { status: 403 }),
+  );
+  await assert.rejects(
+    api.file("A"),
+    (error) =>
+      error instanceof FigmaApiError &&
+      !error.message.includes("private-token"),
+  );
+});
+test("long Retry-After fails promptly rather than retrying too early", async () => {
+  let calls = 0;
+  const api = new RestFigmaApi("token", async () => {
+    calls++;
+    return new Response("", {
+      status: 429,
+      headers: { "Retry-After": "3600" },
+    });
+  });
+  await assert.rejects(api.file("A"), /Rate limited/);
+  assert.equal(calls, 1);
+});
+test("auth store writes credentials outside project manifest and removes them", async (t) => {
+  const f = await fixture(t);
+  const store = new AuthStore(path.join(f.cwd, "auth"));
+  await store.saveToken("test-token");
+  const config = JSON.parse(
+    await readFile(path.join(store.directory, "config.json"), "utf8"),
+  );
+  assert.equal(config.token, "test-token");
+  await store.logout();
+  assert.deepEqual(await readdir(store.directory), []);
+});
+test("successful sync records the exact local hash", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const file = (await readManifest(f.cwd)).files[0];
+  assert.equal(
+    file.synced.sha256,
+    createHash("sha256")
+      .update(await readFile(path.join(f.cwd, file.localPath)))
+      .digest("hex"),
+  );
+});
+
+test("remote moves and repeated individual add reuse the established file", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Root",
+    files: [{ key: "A", name: "A" }],
+    folders: [{ id: "456", name: "Child" }],
+  });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  f.listings.set("123", {
+    name: "Root",
+    files: [],
+    folders: [{ id: "456", name: "Child" }],
+  });
+  f.listings.set("456", {
+    name: "Child",
+    files: [{ key: "A", name: "A" }],
+    folders: [],
+  });
+  await f.client.sync({ cwd: f.cwd });
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  assert.equal(f.downloads.length, 1);
+  assert.equal((await readManifest(f.cwd)).files.length, 0);
+  assert.equal(
+    (await readManifest(path.join(f.cwd, "root", "Child"))).files.length,
+    0,
+  );
+});
+test("recursive folder cycles do not create an unbounded directory tree", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Root",
+    files: [],
+    folders: [{ id: "456", name: "Child" }],
+  });
+  f.listings.set("456", {
+    name: "Child",
+    files: [],
+    folders: [{ id: "123", name: "Root again" }],
+  });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  assert.deepEqual(await readdir(path.join(f.cwd, "root", "Child")), [
+    ".sync.fig.json",
+  ]);
+});
+test("unknown manifest extension data survives fetch and sync", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  await withManifest(f.cwd, async (m) => {
+    m.external = { app: "consumer" };
+    m.files[0].remote.external = "remote";
+    m.files[0].synced.external = "local";
+  });
+  f.versions.set("A", { version: "2" });
+  await f.client.sync({ cwd: f.cwd });
+  const m = await readManifest(f.cwd);
+  assert.equal(m.external.app, "consumer");
+  assert.equal(m.files[0].remote.external, "remote");
+  assert.equal(m.files[0].synced.external, "local");
+});
+test("REST folder discovery uses both v2 endpoints and rejects partial results", async () => {
+  const calls = [];
+  const api = new RestFigmaApi("token", async (url) => {
+    calls.push(url);
+    return Response.json(
+      url.endsWith("/files")
+        ? { name: "Root", files: [{ key: "A", name: "A" }] }
+        : { folders: [{ id: "456", name: "Child" }] },
+    );
+  });
+  assert.deepEqual(await api.folder("123"), {
+    name: "Root",
+    files: [{ key: "A", name: "A" }],
+    folders: [{ id: "456", name: "Child" }],
+  });
+  assert.deepEqual(calls, [
+    "https://api.figma.com/v2/folders/123/files",
+    "https://api.figma.com/v2/folders/123/folders",
+  ]);
+  const broken = new RestFigmaApi("token", async (url) =>
+    url.endsWith("/files")
+      ? Response.json({ files: [] })
+      : new Response("denied", { status: 403 }),
+  );
+  await assert.rejects(broken.folder("123"), /403/);
+});
+test("no-recursive skips child manifests and leaves them untouched", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", {
+    cwd: f.cwd,
+    directory: "child",
+  });
+  const before = await readManifest(path.join(f.cwd, "child"));
+  f.versions.set("A", { version: "2" });
+  const result = await f.client.fetch({ cwd: f.cwd, recursive: false });
+  assert.deepEqual(result.items, []);
+  assert.deepEqual(await readManifest(path.join(f.cwd, "child")), before);
+});
+
+test("sync progress reports folder counts and file stages before downloader runs", async (t) => {
+  const events = [];
+  const f = await fixture(t, { onProgress: (event) => events.push(event) });
+  f.listings.set("123", {
+    name: "Root",
+    files: [{ key: "A", name: "A" }],
+    folders: [],
+  });
+  const native = f.downloader.download;
+  f.downloader.download = async (...args) => {
+    assert.ok(events.some((event) => event.message.includes("Found 1 files")));
+    assert.ok(
+      events.some((event) => event.message.includes("Downloading file 1/1")),
+    );
+    return native(...args);
+  };
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  assert.ok(
+    events.some((event) =>
+      event.message.includes("Verifying remote version after download"),
+    ),
+  );
+  assert.ok(
+    events.some((event) => event.message.includes("Hashing and committing")),
+  );
+});
