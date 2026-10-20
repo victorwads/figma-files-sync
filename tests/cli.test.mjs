@@ -26,15 +26,12 @@ async function fixture(t) {
     });
   return { cwd, run };
 }
-test("help first initializes the directory manifest", async (t) => {
+test("help leaves the working directory untouched", async (t) => {
   const f = await fixture(t);
   const result = f.run("--help");
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /figma-files-sync/);
-  assert.deepEqual(
-    JSON.parse(await readFile(path.join(f.cwd, ".sync.fig.json"), "utf8")),
-    { schemaVersion: 1, folder: null, files: [] },
-  );
+  assert.deepEqual(await readdir(f.cwd), []);
 });
 test("empty fetch and sync work without credentials or a browser", async (t) => {
   const f = await fixture(t);
@@ -43,7 +40,7 @@ test("empty fetch and sync work without credentials or a browser", async (t) => 
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { items: [], errors: [] });
   }
-  assert.deepEqual(await readdir(f.cwd), [".sync.fig.json"]);
+  assert.deepEqual(await readdir(f.cwd), []);
 });
 test("auth status uses structured output and does not need credentials", async (t) => {
   const f = await fixture(t);
@@ -56,23 +53,18 @@ test("auth status uses structured output and does not need credentials", async (
     validity: "not-checked",
   });
 });
-test("invalid add initializes manifest but does not register anything", async (t) => {
+test("invalid add leaves no manifest", async (t) => {
   const f = await fixture(t);
   const result = f.run("add", "https://evil.example/design/A", "--json");
   assert.equal(result.status, 1);
   assert.match(JSON.parse(result.stdout).error, /Figma|figma/);
-  assert.deepEqual(
-    JSON.parse(await readFile(path.join(f.cwd, ".sync.fig.json"), "utf8"))
-      .files,
-    [],
-  );
+  assert.deepEqual(await readdir(f.cwd), []);
 });
-test("malformed manifest prevents even help and remains unchanged", async (t) => {
+test("help ignores malformed manifest and leaves it unchanged", async (t) => {
   const f = await fixture(t);
   await writeFile(path.join(f.cwd, ".sync.fig.json"), "invalid");
   const result = f.run("--help");
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /Invalid/);
+  assert.equal(result.status, 0);
   assert.equal(
     await readFile(path.join(f.cwd, ".sync.fig.json"), "utf8"),
     "invalid",
@@ -141,4 +133,35 @@ test("CLI version matches the published package metadata", async (t) => {
   const result = f.run("--version");
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), metadata.version);
+});
+
+test("version, auth and failed login do not create project manifests", async (t) => {
+  const f = await fixture(t);
+  for (const args of [
+    ["--version"],
+    ["auth", "status"],
+    ["logout"],
+    ["login", "--only-token"],
+  ]) {
+    f.run(...args);
+    assert.deepEqual(await readdir(f.cwd), [], args.join(" "));
+  }
+});
+test("failed add without API credentials leaves no empty manifest or lock", async (t) => {
+  const f = await fixture(t);
+  const r = f.run("add", "https://figma.com/design/A", "--json");
+  assert.equal(r.status, 1);
+  assert.match(JSON.parse(r.stdout).error, /No Figma API token/);
+  assert.deepEqual(await readdir(f.cwd), []);
+});
+test("data commands reject malformed manifests without altering them", async (t) => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.cwd, ".sync.fig.json"), "invalid");
+  const r = f.run("fetch", "--json");
+  assert.equal(r.status, 1);
+  assert.match(JSON.parse(r.stdout).error, /Invalid/);
+  assert.equal(
+    await readFile(path.join(f.cwd, ".sync.fig.json"), "utf8"),
+    "invalid",
+  );
 });

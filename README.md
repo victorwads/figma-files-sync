@@ -83,7 +83,7 @@ figma-files-sync fetch
 figma-files-sync sync
 ```
 
-Every CLI invocation first reads or creates **one `.sync.fig.json` in the current directory**, including help and authentication commands:
+A `.sync.fig.json` is created **only when registering or persisting managed state** in that directory. Help, version and authentication commands never read or create project manifests. Fetch/sync process existing manifests without creating empty ones, and failed registrations leave no empty manifest. Its base structure is:
 
 ```json
 {

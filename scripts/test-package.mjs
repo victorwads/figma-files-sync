@@ -92,11 +92,9 @@ try {
   );
   if (result.items.length || result.errors.length)
     throw new Error("Empty npm exec/npx failed.");
-  const manifest = JSON.parse(
-    await readFile(path.join(consumer, ".sync.fig.json"), "utf8"),
-  );
-  if (manifest.schemaVersion !== 1)
-    throw new Error("Missing initialized manifest.");
+  const { readdir } = await import("node:fs/promises");
+  if ((await readdir(consumer)).includes(".sync.fig.json"))
+    throw new Error("Read-only commands created an empty manifest.");
   await run(
     [
       "--input-type=module",

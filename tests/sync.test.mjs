@@ -500,7 +500,7 @@ test("remote moves and repeated individual add reuse the established file", asyn
   await f.client.sync({ cwd: f.cwd });
   await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
   assert.equal(f.downloads.length, 1);
-  assert.equal((await readManifest(f.cwd)).files.length, 0);
+  assert.ok(!(await readdir(f.cwd)).includes(".sync.fig.json"));
   assert.equal(
     (await readManifest(path.join(f.cwd, "root", "Child"))).files.length,
     0,
@@ -677,4 +677,31 @@ test("parallel failures preserve other worker successes and release locks only a
   assert.equal(m.files.filter((file) => file.synced).length, 2);
   assert.equal(m.files.find((file) => file.key === "B").synced, null);
   assert.ok(!(await readdir(dir)).includes(".sync.fig.lock"));
+});
+
+test("failed and unsupported registrations do not persist empty manifests", async (t) => {
+  const f = await fixture(t);
+  f.versions.set("A", new FigmaApiError(404, "missing"));
+  await assert.rejects(
+    f.client.add("https://figma.com/design/A", { cwd: f.cwd }),
+  );
+  assert.deepEqual(await readdir(f.cwd), []);
+  f.versions.set("B", { editorType: "figjam" });
+  await assert.rejects(
+    f.client.add("https://figma.com/design/B", { cwd: f.cwd }),
+  );
+  assert.deepEqual(await readdir(f.cwd), []);
+});
+test("adding a folder only creates its target manifest, not an empty parent", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", { name: "Root", files: [], folders: [] });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "designs",
+  });
+  assert.ok(!(await readdir(f.cwd)).includes(".sync.fig.json"));
+  assert.equal(
+    (await readManifest(path.join(f.cwd, "designs"))).folder.id,
+    "123",
+  );
 });

@@ -146,6 +146,12 @@ export async function ensureManifest(directory: string): Promise<Manifest> {
   }
   return readManifest(directory);
 }
+/** Load an absent manifest in memory only; persist it when meaningful state is saved. */
+export async function loadManifest(directory: string): Promise<Manifest> {
+  return (await assertRegular(path.join(directory, MANIFEST_NAME)))
+    ? readManifest(directory)
+    : emptyManifest();
+}
 export async function readManifest(directory: string): Promise<Manifest> {
   const file = path.join(directory, MANIFEST_NAME);
   if (!(await assertRegular(file)))
@@ -203,7 +209,9 @@ export async function saveManifest(
   const write = previous
     .catch(() => {})
     .then(async () => {
-      if ((await readFile(file, "utf8")) !== content)
+      const exists = await assertRegular(file);
+      if (!exists && !manifest.folder && manifest.files.length === 0) return;
+      if (!exists || (await readFile(file, "utf8")) !== content)
         await atomicWrite(file, content);
     });
   manifestWrites.set(key, write);
@@ -234,11 +242,13 @@ export async function withManifest<T>(
     throw error;
   }
   try {
-    const manifest = await ensureManifest(directory);
+    const manifest = await loadManifest(directory);
+    const before = JSON.stringify(manifest);
     try {
       return await action(manifest);
     } finally {
-      await saveManifest(directory, manifest);
+      if (JSON.stringify(manifest) !== before)
+        await saveManifest(directory, manifest);
     }
   } finally {
     await unlink(lock);

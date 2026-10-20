@@ -21,7 +21,7 @@ import {
   type Manifest,
   type ManagedFile,
   withManifest,
-  ensureManifest,
+  loadManifest,
   readManifest,
   saveManifest,
   allocateName,
@@ -113,7 +113,6 @@ export class FigmaSync {
     options: RunOptions & { directory?: string } = {},
   ): Promise<SyncResult> {
     const cwd = path.resolve(options.cwd ?? process.cwd());
-    await ensureManifest(cwd);
     const ref = parseFigmaUrl(url);
     const api = await this.api();
     if (ref.kind === "file") {
@@ -206,7 +205,7 @@ export class FigmaSync {
     parent: string,
     id: string,
   ): Promise<string | undefined> {
-    if ((await readManifest(parent)).folder?.id === id) return parent;
+    if ((await loadManifest(parent)).folder?.id === id) return parent;
     for (const entry of await readdir(parent, { withFileTypes: true })) {
       if (
         !entry.isDirectory() ||
@@ -233,11 +232,14 @@ export class FigmaSync {
       phase: "manifest",
       message: "Reading manifests in " + root,
     });
-    await ensureManifest(root);
     const api = await this.api();
     const result: SyncResult = { items: [], errors: [] };
     const directories =
-      options.recursive === false ? [root] : await discoverDirectories(root);
+      options.recursive === false
+        ? (await assertRegular(path.join(root, ".sync.fig.json")))
+          ? [root]
+          : []
+        : await discoverDirectories(root);
     const known = new Map<string, string>();
     for (const directory of directories)
       for (const file of (await readManifest(directory)).files) {

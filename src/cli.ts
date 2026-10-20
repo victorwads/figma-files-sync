@@ -10,7 +10,6 @@ import { AuthStore, browserLogin, browserAuthenticated } from "./auth.js";
 import { login, type LoginOptions } from "./login.js";
 import { RestFigmaApi } from "./api.js";
 import { createFigmaSync, type SyncResult } from "./sync.js";
-import { ensureManifest } from "./manifest.js";
 import { createProgressLogger } from "./progress.js";
 import { concurrencyLimit } from "./concurrency.js";
 
@@ -346,8 +345,6 @@ authCommand
       );
   });
 try {
-  // Every invocation initializes the current directory, including help and auth commands.
-  await ensureManifest(process.cwd());
   await program.parseAsync();
 } catch (error) {
   const message = error instanceof Error ? error.message : "Command failed.";
