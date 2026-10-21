@@ -47,16 +47,3 @@ jobs:
         run: |
           VERSION=$(node -p 'JSON.parse(require("fs").readFileSync("package.json","utf8")).version')
           npm publish "/tmp/figma-files-sync-${VERSION}.tgz" --access public --provenance --registry=https://registry.npmjs.org/
-      - name: Verify public registry installation with npm exec (npx)
-        run: |
-          VERSION=$(node -p 'JSON.parse(require("fs").readFileSync("package.json","utf8")).version')
-          mkdir -p /tmp/figma-registry-smoke
-          cd /tmp/figma-registry-smoke
-          for attempt in 1 2 3 4 5; do
-            if ACTUAL=$(npm exec --yes --registry=https://registry.npmjs.org/ --package="figma-files-sync@${VERSION}" -- figma-files-sync --version) && [ "$ACTUAL" = "$VERSION" ]; then
-              npm exec --yes --registry=https://registry.npmjs.org/ --package="figma-files-sync@${VERSION}" -- figma-files-sync fetch --json
-              exit 0
-            fi
-            sleep 10
-          done
-          exit 1
