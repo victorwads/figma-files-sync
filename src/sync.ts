@@ -1,4 +1,9 @@
-import { concurrencyLimit, forEachConcurrent } from "./concurrency.js";
+import { parseDuration, isFresh } from "./freshness.js";
+import {
+  concurrencyLimit,
+  forEachConcurrent,
+  TaskQueue,
+} from "./concurrency.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { copyFile, rename, unlink, readdir } from "node:fs/promises";
@@ -21,6 +26,7 @@ import {
   type Manifest,
   type ManagedFile,
   withManifest,
+  acquireManifest,
   loadManifest,
   readManifest,
   saveManifest,
@@ -57,6 +63,9 @@ export interface RunOptions {
   cwd?: string;
   recursive?: boolean;
   force?: boolean;
+  /** Skip fresh discovery/metadata checks, not pending downloads (e.g. 10m). */
+  ignore?: string;
+  recoverLocks?: boolean;
 }
 export interface ClientOptions extends DownloadOptions {
   token?: string;
@@ -64,6 +73,10 @@ export interface ClientOptions extends DownloadOptions {
   api?: FigmaApi;
   downloader?: NativeDownloader;
   onEvent?: (item: SyncItem) => void;
+  /** Maximum concurrent API operations, independent from browser tabs (1–3). */
+  apiConcurrency?: number;
+  recoverLocks?: boolean;
+  ignore?: string;
 }
 export function planFile(
   file: ManagedFile,
@@ -86,11 +99,14 @@ export function planFile(
 export class FigmaSync {
   private readonly auth: AuthStore;
   private apiInstance?: FigmaApi;
+  private readonly apiQueue: TaskQueue;
   private readonly downloader: NativeDownloader;
   constructor(private readonly options: ClientOptions = {}) {
     concurrencyLimit(options.concurrency);
+    parseDuration(options.ignore);
+    this.apiQueue = new TaskQueue(concurrencyLimit(options.apiConcurrency));
     this.auth = new AuthStore(options.authDirectory);
-    this.apiInstance = options.api;
+    if (options.api) this.apiInstance = this.scheduleApi(options.api);
     this.downloader =
       options.downloader ?? new PlaywrightDownloader(this.auth, options);
   }
@@ -99,11 +115,29 @@ export class FigmaSync {
       phase: "auth",
       message: "Loading Figma API credentials",
     });
-    return (this.apiInstance ??= new RestFigmaApi(
-      this.options.token ?? (await this.auth.token()) ?? "",
-      undefined,
-      this.options.onProgress,
+    return (this.apiInstance ??= this.scheduleApi(
+      new RestFigmaApi(
+        this.options.token ?? (await this.auth.token()) ?? "",
+        undefined,
+        this.options.onProgress,
+        this.options.signal,
+      ),
     ));
+  }
+  private scheduleApi(api: FigmaApi): FigmaApi {
+    return {
+      file: (key) =>
+        this.apiQueue.run(() => {
+          this.options.signal?.throwIfAborted();
+          return api.file(key);
+        }),
+      folder: (id) =>
+        this.apiQueue.run(() => {
+          this.options.signal?.throwIfAborted();
+          return api.folder(id);
+        }),
+      validateToken: () => this.apiQueue.run(() => api.validateToken()),
+    };
   }
   async close(): Promise<void> {
     await this.downloader.close();
@@ -112,7 +146,9 @@ export class FigmaSync {
     url: string,
     options: RunOptions & { directory?: string } = {},
   ): Promise<SyncResult> {
+    this.options.signal?.throwIfAborted();
     const cwd = path.resolve(options.cwd ?? process.cwd());
+    const ignoreMs = parseDuration(options.ignore ?? this.options.ignore);
     const ref = parseFigmaUrl(url);
     const api = await this.api();
     if (ref.kind === "file") {
@@ -129,31 +165,51 @@ export class FigmaSync {
           }
         }
       }
-      await withManifest(directory, async (manifest) => {
-        if (manifest.files.some((f) => f.key === ref.id)) return;
-        const meta = await api.file(ref.id);
-        if (meta.editorType !== "figma")
-          throw new Error("Only Figma Design .fig documents are supported.");
-        const localPath = await allocateName(
-          directory,
-          meta.name,
-          meta.key,
-          manifest.files.map((f) => f.localPath),
-        );
-        manifest.files.push({
-          key: ref.id,
-          url: ref.url,
-          name: meta.name,
-          localPath,
-          remote: this.remote(meta),
-          synced: null,
-        });
-      });
+      await withManifest(
+        directory,
+        async (manifest) => {
+          if (manifest.files.some((f) => f.key === ref.id)) return;
+          const meta = await api.file(ref.id);
+          if (meta.editorType !== "figma")
+            throw new Error("Only Figma Design .fig documents are supported.");
+          const localPath = await allocateName(
+            directory,
+            meta.name,
+            meta.key,
+            manifest.files.map((f) => f.localPath),
+          );
+          manifest.files.push({
+            key: ref.id,
+            url: ref.url,
+            name: meta.name,
+            localPath,
+            remote: this.remote(meta),
+            synced: null,
+          });
+        },
+        options.recoverLocks ?? this.options.recoverLocks,
+      );
       return this.run(
         { ...options, cwd: directory, recursive: false },
         true,
         ref.id,
       );
+    }
+    const existingDirectory = options.directory
+      ? path.resolve(cwd, options.directory)
+      : await this.findFolder(cwd, ref.id);
+    if (existingDirectory) {
+      const existing = await loadManifest(existingDirectory);
+      if (
+        existing.folder?.id === ref.id &&
+        existing.folder.subfolders &&
+        isFresh(existing.folder.lastFetchedAt, ignoreMs)
+      ) {
+        return this.run(
+          { ...options, cwd: existingDirectory, recursive: true },
+          true,
+        );
+      }
     }
     this.options.onProgress?.({
       phase: "discovery",
@@ -178,13 +234,17 @@ export class FigmaSync {
         existing ??
         path.join(cwd, await allocateName(cwd, listing.name, ref.id, [], ""));
     }
-    await withManifest(directory, async (manifest) => {
-      if (manifest.folder && manifest.folder.id !== ref.id)
-        throw new Error(
-          "Directory is already associated with another Figma folder.",
-        );
-      manifest.folder ??= { id: ref.id, url: ref.url, name: listing.name };
-    });
+    await withManifest(
+      directory,
+      async (manifest) => {
+        if (manifest.folder && manifest.folder.id !== ref.id)
+          throw new Error(
+            "Directory is already associated with another Figma folder.",
+          );
+        manifest.folder ??= { id: ref.id, url: ref.url, name: listing.name };
+      },
+      options.recoverLocks ?? this.options.recoverLocks,
+    );
     return this.run({ ...options, cwd: directory, recursive: true }, true);
   }
   async fetch(options: RunOptions = {}): Promise<SyncResult> {
@@ -198,7 +258,29 @@ export class FigmaSync {
       version: meta.version,
       modifiedAt: meta.modifiedAt,
       checkedAt: new Date().toISOString(),
+      lastSuccessfulCheckedAt: new Date().toISOString(),
+      editorType: meta.editorType,
       availability: "available",
+    };
+  }
+  private cachedMetadata(
+    file: ManagedFile,
+    ignoreMs: number,
+  ): FileMetadata | undefined {
+    const remote = file.remote;
+    if (
+      remote?.availability !== "available" ||
+      !remote.version ||
+      !remote.editorType ||
+      !isFresh(remote.lastSuccessfulCheckedAt, ignoreMs)
+    )
+      return;
+    return {
+      key: file.key,
+      name: file.name,
+      version: remote.version,
+      modifiedAt: remote.modifiedAt,
+      editorType: remote.editorType,
     };
   }
   private async findFolder(
@@ -227,6 +309,8 @@ export class FigmaSync {
     download: boolean,
     onlyKey?: string,
   ): Promise<SyncResult> {
+    const ignoreMs = parseDuration(options.ignore ?? this.options.ignore);
+    this.options.signal?.throwIfAborted();
     const root = path.resolve(options.cwd ?? process.cwd());
     this.options.onProgress?.({
       phase: "manifest",
@@ -245,6 +329,44 @@ export class FigmaSync {
       for (const file of (await readManifest(directory)).files) {
         if (!known.has(file.key)) known.set(file.key, directory);
       }
+    const leases: Awaited<ReturnType<typeof acquireManifest>>[] = [];
+    const downloads = new TaskQueue(concurrencyLimit(this.options.concurrency));
+    const pending = new Set<Promise<void>>();
+    // Bound discovery look-ahead; in-flight metadata producers can exceed this high-water mark by at most their concurrency.
+    const maxPending = 32;
+    const enqueue = async (action: () => Promise<void>) => {
+      this.options.signal?.throwIfAborted();
+      while (pending.size >= maxPending) {
+        this.options.signal?.throwIfAborted();
+        this.options.onProgress?.({
+          phase: "download",
+          message:
+            "Download queue full (" + pending.size + "); waiting for capacity",
+        });
+        await Promise.race(pending);
+      }
+      const job = downloads
+        .run(() => {
+          this.options.signal?.throwIfAborted();
+          return action();
+        })
+        .catch((error) => {
+          result.errors.push(
+            error instanceof Error ? error.message : "Download worker failed",
+          );
+        });
+      pending.add(job);
+      void job.then(() => pending.delete(job));
+      this.options.onProgress?.({
+        phase: "download",
+        message:
+          "Download queue: " +
+          downloads.running +
+          " active, " +
+          downloads.waiting +
+          " waiting; API discovery continues",
+      });
+    };
     const visited = new Set<string>();
     const folderIds = new Map<string, string>();
     const emit = (item: SyncItem) => {
@@ -252,6 +374,7 @@ export class FigmaSync {
       this.options.onEvent?.(item);
     };
     const visit = async (directory: string): Promise<void> => {
+      this.options.signal?.throwIfAborted();
       if (visited.has(directory)) return;
       visited.add(directory);
       const children: { id: string; name: string }[] = [];
@@ -260,7 +383,13 @@ export class FigmaSync {
           phase: "manifest",
           message: "Processing directory " + directory,
         });
-        await withManifest(directory, async (manifest) => {
+        const lease = await acquireManifest(
+          directory,
+          options.recoverLocks ?? this.options.recoverLocks,
+        );
+        leases.push(lease);
+        const manifest = lease.manifest;
+        {
           if (manifest.folder) {
             const folder = manifest.folder;
             const prior = folderIds.get(folder.id);
@@ -269,70 +398,85 @@ export class FigmaSync {
                 "Duplicate folder registration in this sync tree: " + folder.id,
               );
             folderIds.set(folder.id, directory);
-            this.options.onProgress?.({
-              phase: "discovery",
-              message: "Listing remote folder " + folder.id,
-            });
-            const listing = await api.folder(folder.id);
-            this.options.onProgress?.({
-              phase: "discovery",
-              message:
-                "Found " +
-                listing.files.length +
-                " files and " +
-                listing.folders.length +
-                " subfolders in " +
-                listing.name,
-            });
-            folder.name = listing.name;
-            folder.lastFetchedAt = new Date().toISOString();
-            children.push(...listing.folders);
-            const present = new Set(listing.files.map((f) => f.key));
-            for (const file of manifest.files)
-              if (file.remote)
-                file.remote.membership = present.has(file.key)
-                  ? "present"
-                  : "absent";
-            for (const remoteFile of listing.files) {
-              if (manifest.files.some((f) => f.key === remoteFile.key))
-                continue;
-              // Keep a document's established local location when it moves remotely.
-              if (
-                known.has(remoteFile.key) &&
-                known.get(remoteFile.key) !== directory
-              )
-                continue;
-              const localPath = await allocateName(
-                directory,
-                remoteFile.name,
-                remoteFile.key,
-                manifest.files.map((f) => f.localPath),
-              );
-              manifest.files.push({
-                key: remoteFile.key,
-                name: remoteFile.name,
-                url: "https://www.figma.com/design/" + remoteFile.key,
-                localPath,
-                remote: {
-                  version: null,
-                  modifiedAt: null,
-                  checkedAt: new Date().toISOString(),
-                  availability: "available",
-                  membership: "present",
-                },
-                synced: null,
+            if (folder.subfolders && isFresh(folder.lastFetchedAt, ignoreMs)) {
+              children.push(...folder.subfolders);
+              this.options.onProgress?.({
+                phase: "discovery",
+                message:
+                  "Reusing successful folder listing from " +
+                  folder.lastFetchedAt +
+                  ": " +
+                  folder.name,
               });
-              known.set(remoteFile.key, directory);
+            } else {
+              this.options.onProgress?.({
+                phase: "discovery",
+                message: "Listing remote folder " + folder.id,
+              });
+              const listing = await api.folder(folder.id);
+              this.options.onProgress?.({
+                phase: "discovery",
+                message:
+                  "Found " +
+                  listing.files.length +
+                  " files and " +
+                  listing.folders.length +
+                  " subfolders in " +
+                  listing.name,
+              });
+              folder.name = listing.name;
+
+              children.push(...listing.folders);
+              const present = new Set(listing.files.map((f) => f.key));
+              for (const file of manifest.files)
+                if (file.remote)
+                  file.remote.membership = present.has(file.key)
+                    ? "present"
+                    : "absent";
+              for (const remoteFile of listing.files) {
+                if (manifest.files.some((f) => f.key === remoteFile.key))
+                  continue;
+                // Keep a document's established local location when it moves remotely.
+                if (
+                  known.has(remoteFile.key) &&
+                  known.get(remoteFile.key) !== directory
+                )
+                  continue;
+                const localPath = await allocateName(
+                  directory,
+                  remoteFile.name,
+                  remoteFile.key,
+                  manifest.files.map((f) => f.localPath),
+                );
+                manifest.files.push({
+                  key: remoteFile.key,
+                  name: remoteFile.name,
+                  url: "https://www.figma.com/design/" + remoteFile.key,
+                  localPath,
+                  remote: {
+                    version: null,
+                    modifiedAt: null,
+                    checkedAt: new Date().toISOString(),
+                    availability: "available",
+                    membership: "present",
+                  },
+                  synced: null,
+                });
+                known.set(remoteFile.key, directory);
+              }
+              folder.subfolders = listing.folders;
+              folder.lastFetchedAt = new Date().toISOString();
+              await saveManifest(directory, manifest);
             }
-            await saveManifest(directory, manifest);
           }
           const selectedFiles = manifest.files.filter(
             (file) => !onlyKey || file.key === onlyKey,
           );
           await forEachConcurrent(
             selectedFiles,
-            download ? concurrencyLimit(this.options.concurrency) : 1,
+            concurrencyLimit(this.options.apiConcurrency),
             async (file, index) => {
+              this.options.signal?.throwIfAborted();
               const fileIndex = index + 1;
               this.options.onProgress?.({
                 phase: "file",
@@ -354,8 +498,19 @@ export class FigmaSync {
               };
               try {
                 let meta: FileMetadata;
+                const cached = this.cachedMetadata(file, ignoreMs);
                 try {
-                  meta = await api.file(file.key);
+                  if (cached)
+                    this.options.onProgress?.({
+                      phase: "api",
+                      message:
+                        "Skipping recent API check for " +
+                        file.localPath +
+                        " (last success " +
+                        file.remote!.lastSuccessfulCheckedAt +
+                        ")",
+                    });
+                  meta = cached ?? (await api.file(file.key));
                 } catch (error) {
                   if (
                     error instanceof FigmaApiError &&
@@ -381,12 +536,15 @@ export class FigmaSync {
                   throw error;
                 }
                 const membership = file.remote?.membership;
-                file.remote = {
-                  ...file.remote,
-                  ...this.remote(meta),
-                  ...(membership ? { membership } : {}),
-                };
+                if (!cached)
+                  file.remote = {
+                    ...file.remote,
+                    ...this.remote(meta),
+                    ...(membership ? { membership } : {}),
+                  };
                 file.name = meta.name;
+                // Checkpoint remote state immediately, before hashing/enqueueing or starting native work.
+                await saveManifest(directory, manifest);
                 if (meta.editorType !== "figma") {
                   emit({
                     ...item,
@@ -408,30 +566,44 @@ export class FigmaSync {
                   return;
                 }
                 await saveManifest(directory, manifest);
-                this.options.onProgress?.({
-                  phase: "download",
-                  message:
-                    "Downloading file " +
-                    fileIndex +
-                    "/" +
-                    selectedFiles.length +
-                    " in " +
-                    directory +
-                    ": " +
-                    file.localPath +
-                    " (" +
-                    status +
-                    ")",
+                await enqueue(async () => {
+                  try {
+                    this.options.onProgress?.({
+                      phase: "download",
+                      message:
+                        "Downloading file " +
+                        fileIndex +
+                        "/" +
+                        selectedFiles.length +
+                        " in " +
+                        directory +
+                        ": " +
+                        file.localPath +
+                        " (" +
+                        status +
+                        ")",
+                    });
+                    await this.downloadFile(
+                      api,
+                      directory,
+                      manifest,
+                      file,
+                      local,
+                      !!options.force,
+                      ignoreMs,
+                    );
+                    emit({ ...item, status: "downloaded" });
+                  } catch (error) {
+                    const message =
+                      error instanceof Error
+                        ? error.message
+                        : "Download failed";
+                    result.errors.push(file.key + ": " + message);
+                    emit({ ...item, status: "error", message });
+                  } finally {
+                    await saveManifest(directory, manifest);
+                  }
                 });
-                await this.downloadFile(
-                  api,
-                  directory,
-                  manifest,
-                  file,
-                  local,
-                  !!options.force,
-                );
-                emit({ ...item, status: "downloaded" });
               } catch (error) {
                 const message =
                   error instanceof Error ? error.message : "Operation failed";
@@ -442,7 +614,7 @@ export class FigmaSync {
               }
             },
           );
-        });
+        }
       } catch (error) {
         result.errors.push(
           directory +
@@ -461,13 +633,17 @@ export class FigmaSync {
                 await allocateName(directory, child.name, child.id, [], ""),
               );
               await ensureDirectory(dir);
-              await withManifest(dir, async (manifest) => {
-                manifest.folder = {
-                  id: child.id,
-                  name: child.name,
-                  url: "https://www.figma.com/files/folder/" + child.id,
-                };
-              });
+              await withManifest(
+                dir,
+                async (manifest) => {
+                  manifest.folder = {
+                    id: child.id,
+                    name: child.name,
+                    url: "https://www.figma.com/files/folder/" + child.id,
+                  };
+                },
+                options.recoverLocks ?? this.options.recoverLocks,
+              );
             }
             if (folderIds.has(child.id)) {
               if (folderIds.get(child.id) !== dir)
@@ -486,7 +662,31 @@ export class FigmaSync {
           }
         }
     };
-    for (const directory of directories) await visit(directory);
+    try {
+      for (const directory of directories) {
+        this.options.signal?.throwIfAborted();
+        await visit(directory);
+      }
+    } finally {
+      this.options.onProgress?.({
+        phase: "download",
+        message:
+          "API discovery complete; draining " +
+          pending.size +
+          " queued/active downloads",
+      });
+      await Promise.all(pending);
+      for (const lease of leases.reverse()) {
+        try {
+          await lease.release();
+        } catch (error) {
+          result.errors.push(
+            error instanceof Error ? error.message : "Manifest release failed",
+          );
+        }
+      }
+    }
+    this.options.signal?.throwIfAborted();
     return result;
   }
   private async downloadFile(
@@ -496,6 +696,7 @@ export class FigmaSync {
     file: ManagedFile,
     initialLocal: { sha256: string } | null,
     force: boolean,
+    ignoreMs: number,
   ): Promise<void> {
     const target = path.join(directory, file.localPath);
     const temp = path.join(directory, ".fig-download-" + randomUUID());
@@ -504,17 +705,31 @@ export class FigmaSync {
         phase: "api",
         message: "Checking remote version before download: " + file.localPath,
       });
-      const before = await api.file(file.key);
+      const cached = this.cachedMetadata(file, ignoreMs);
+      const before = cached ?? (await api.file(file.key));
+      if (!cached) {
+        file.name = before.name;
+        file.remote = { ...file.remote, ...this.remote(before) };
+        await saveManifest(directory, manifest);
+      } else
+        this.options.onProgress?.({
+          phase: "api",
+          message: "Reusing checked version before download: " + file.localPath,
+        });
       if (before.editorType !== "figma")
         throw new Error("Document is not Figma Design.");
+      this.options.signal?.throwIfAborted();
       await this.downloader.download(file.key, temp);
+      this.options.signal?.throwIfAborted();
       await verifyNativeFile(temp);
       this.options.onProgress?.({
         phase: "api",
         message: "Verifying remote version after download: " + file.localPath,
       });
       const after = await api.file(file.key);
+      file.name = after.name;
       file.remote = { ...file.remote, ...this.remote(after) };
+      await saveManifest(directory, manifest);
       if (
         !before.version ||
         before.version !== after.version ||
@@ -545,6 +760,7 @@ export class FigmaSync {
       });
       const downloaded = await hashFile(temp);
       if (!downloaded) throw new Error("Download missing.");
+      this.options.signal?.throwIfAborted();
       await rename(temp, target);
       file.synced = {
         ...file.synced,

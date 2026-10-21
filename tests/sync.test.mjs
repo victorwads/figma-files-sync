@@ -705,3 +705,524 @@ test("adding a folder only creates its target manifest, not an empty parent", as
     "123",
   );
 });
+
+function pipelineGate() {
+  let release;
+  const promise = new Promise((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+test(
+  "API producer discovers all later files while a single download remains blocked",
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t, { concurrency: 1, apiConcurrency: 1 });
+    const downloadStarted = pipelineGate(),
+      releaseDownload = pipelineGate(),
+      discovered = pipelineGate();
+    const calls = [];
+    const originalApi = f.api.file;
+    const originalDownload = f.downloader.download;
+    f.api.file = async (key) => {
+      calls.push(key);
+      if (key === "C") discovered.release();
+      return originalApi(key);
+    };
+    f.downloader.download = async (key, target) => {
+      if (key === "A") {
+        downloadStarted.release();
+        await releaseDownload.promise;
+      }
+      return originalDownload(key, target);
+    };
+    f.listings.set("123", {
+      name: "Root",
+      files: [
+        { key: "A", name: "A" },
+        { key: "B", name: "B" },
+        { key: "C", name: "C" },
+      ],
+      folders: [],
+    });
+    let finished = false;
+    const work = f.client
+      .add("https://figma.com/files/folder/123", {
+        cwd: f.cwd,
+        directory: "root",
+      })
+      .finally(() => {
+        finished = true;
+      });
+    try {
+      await downloadStarted.promise;
+      await discovered.promise;
+      assert.equal(finished, false);
+      assert.ok(calls.includes("B"));
+      assert.ok(calls.includes("C"));
+      const dir = path.join(f.cwd, "root");
+      await assert.rejects(
+        withManifest(dir, async () => {}),
+        /locked/,
+      );
+      const m = await readManifest(dir);
+      assert.equal(m.files.length, 3);
+      assert.equal(m.files[0].synced, null);
+    } finally {
+      releaseDownload.release();
+    }
+    const result = await work;
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.downloads.length, 3);
+  },
+);
+test(
+  "folder discovery advances across directories before download lane drains",
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t, { concurrency: 1 });
+    const started = pipelineGate(),
+      release = pipelineGate(),
+      childSeen = pipelineGate();
+    f.listings.set("123", {
+      name: "Root",
+      files: [{ key: "A", name: "A" }],
+      folders: [{ id: "456", name: "Child" }],
+    });
+    f.listings.set("456", {
+      name: "Child",
+      files: [{ key: "B", name: "B" }],
+      folders: [],
+    });
+    const originalFolder = f.api.folder;
+    f.api.folder = async (id) => {
+      if (id === "456") childSeen.release();
+      return originalFolder(id);
+    };
+    const originalDownload = f.downloader.download;
+    f.downloader.download = async (key, target) => {
+      if (key === "A") {
+        started.release();
+        await release.promise;
+      }
+      return originalDownload(key, target);
+    };
+    const work = f.client.add("https://figma.com/files/folder/123", {
+      cwd: f.cwd,
+      directory: "root",
+    });
+    try {
+      await started.promise;
+      await childSeen.promise;
+      assert.equal(f.downloads.length, 0);
+    } finally {
+      release.release();
+    }
+    const result = await work;
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.downloads.length, 2);
+  },
+);
+test(
+  "API concurrency limit is independent from the number of browser workers",
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t, { concurrency: 1, apiConcurrency: 2 });
+    let active = 0,
+      maxActive = 0;
+    const original = f.api.file;
+    f.api.file = async (key) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        return await original(key);
+      } finally {
+        active--;
+      }
+    };
+    f.listings.set("123", {
+      name: "Root",
+      files: [
+        { key: "A", name: "A" },
+        { key: "B", name: "B" },
+        { key: "C", name: "C" },
+      ],
+      folders: [],
+    });
+    const result = await f.client.add("https://figma.com/files/folder/123", {
+      cwd: f.cwd,
+      directory: "root",
+    });
+    assert.deepEqual(result.errors, []);
+    assert.equal(maxActive, 2);
+    assert.equal(f.downloads.length, 3);
+  },
+);
+test(
+  "later folder API failure drains earlier downloads and releases all locks",
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t);
+    f.listings.set("123", {
+      name: "Root",
+      files: [{ key: "A", name: "A" }],
+      folders: [{ id: "456", name: "Child" }],
+    });
+    f.listings.set("456", new Error("rate limited child"));
+    const result = await f.client.add("https://figma.com/files/folder/123", {
+      cwd: f.cwd,
+      directory: "root",
+    });
+    assert.ok(result.errors.some((e) => e.includes("rate limited child")));
+    assert.equal(f.downloads.length, 1);
+    const dir = path.join(f.cwd, "root");
+    assert.ok((await readManifest(dir)).files[0].synced);
+    assert.ok(!(await readdir(dir)).includes(".sync.fig.lock"));
+  },
+);
+test("fetch uses API concurrency without starting a browser or download queue", async (t) => {
+  const f = await fixture(t, { apiConcurrency: 2 });
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  await f.client.add("https://figma.com/design/B", { cwd: f.cwd });
+  const before = f.downloads.length;
+  const result = await f.client.fetch({ cwd: f.cwd });
+  assert.deepEqual(result.errors, []);
+  assert.equal(f.downloads.length, before);
+});
+
+test(
+  "bounded backlog pauses API look-ahead while download lane is blocked",
+  { timeout: 10000 },
+  async (t) => {
+    const full = pipelineGate(),
+      release = pipelineGate();
+    const f = await fixture(t, {
+      onProgress: (event) => {
+        if (event.message.includes("Download queue full")) full.release();
+      },
+    });
+    const files = Array.from({ length: 40 }, (_, i) => ({
+      key: "K" + i,
+      name: "File " + i,
+    }));
+    f.listings.set("123", { name: "Root", files, folders: [] });
+    const original = f.downloader.download;
+    f.downloader.download = async (...args) => {
+      await release.promise;
+      return original(...args);
+    };
+    let checked = 0;
+    const originalApi = f.api.file;
+    f.api.file = async (key) => {
+      checked++;
+      return originalApi(key);
+    };
+    const work = f.client.add("https://figma.com/files/folder/123", {
+      cwd: f.cwd,
+      directory: "root",
+    });
+    try {
+      await full.promise;
+      assert.ok(checked < 40);
+      assert.equal(f.downloads.length, 0);
+    } finally {
+      release.release();
+    }
+    const result = await work;
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.downloads.length, 40);
+    assert.ok(
+      (await readManifest(path.join(f.cwd, "root"))).files.every(
+        (file) => file.synced,
+      ),
+    );
+  },
+);
+test(
+  "an API wait does not stop an already running browser transfer",
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t);
+    const browserStarted = pipelineGate(),
+      releaseBrowser = pipelineGate(),
+      apiWaiting = pipelineGate(),
+      releaseApi = pipelineGate(),
+      transferDone = pipelineGate();
+    f.listings.set("123", {
+      name: "Root",
+      files: [
+        { key: "A", name: "A" },
+        { key: "B", name: "B" },
+      ],
+      folders: [],
+    });
+    const originalApi = f.api.file;
+    f.api.file = async (key) => {
+      if (key === "B") {
+        await browserStarted.promise;
+        apiWaiting.release();
+        await releaseApi.promise;
+      }
+      return originalApi(key);
+    };
+    const originalDownload = f.downloader.download;
+    f.downloader.download = async (key, target) => {
+      if (key === "A") {
+        browserStarted.release();
+        await releaseBrowser.promise;
+      }
+      await originalDownload(key, target);
+      if (key === "A") transferDone.release();
+    };
+    const work = f.client.add("https://figma.com/files/folder/123", {
+      cwd: f.cwd,
+      directory: "root",
+    });
+    try {
+      await apiWaiting.promise;
+      releaseBrowser.release();
+      await transferDone.promise;
+      assert.ok(f.downloads.includes("A"));
+    } finally {
+      releaseApi.release();
+      releaseBrowser.release();
+    }
+    const result = await work;
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.downloads.length, 2);
+  },
+);
+
+test("ignore caches successful checks without extending their timestamp", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const before = (await readManifest(f.cwd)).files[0].remote
+    .lastSuccessfulCheckedAt;
+  let calls = 0;
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return original(key);
+  };
+  await f.client.fetch({ cwd: f.cwd, ignore: "10m" });
+  await f.client.sync({ cwd: f.cwd, ignore: "10m" });
+  assert.equal(calls, 0);
+  assert.equal(f.downloads.length, 1);
+  assert.equal(
+    (await readManifest(f.cwd)).files[0].remote.lastSuccessfulCheckedAt,
+    before,
+  );
+});
+test("pending version survives failure and a new client retries native download with cached discovery", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  f.versions.set("A", { version: "2" });
+  await f.client.fetch({ cwd: f.cwd });
+  const timestamp = (await readManifest(f.cwd)).files[0].remote
+    .lastSuccessfulCheckedAt;
+  let calls = 0;
+  const originalApi = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return originalApi(key);
+  };
+  const originalDownload = f.downloader.download;
+  f.downloader.download = async () => {
+    const m = await readManifest(f.cwd);
+    assert.equal(m.files[0].remote.version, "2");
+    assert.equal(m.files[0].synced.version, "1");
+    throw new Error("interrupted transfer");
+  };
+  const failed = await f.client.sync({ cwd: f.cwd, ignore: "10m" });
+  assert.equal(failed.errors.length, 1);
+  assert.equal(calls, 0);
+  assert.equal(
+    (await readManifest(f.cwd)).files[0].remote.lastSuccessfulCheckedAt,
+    timestamp,
+  );
+  f.downloader.download = originalDownload;
+  const retry = createFigmaSync({ api: f.api, downloader: f.downloader });
+  try {
+    const result = await retry.sync({ cwd: f.cwd, ignore: "10m" });
+    assert.deepEqual(result.errors, []);
+  } finally {
+    await retry.close();
+  }
+  // Only the mandatory post-download validation goes to the API; cached discovery and precheck do not.
+  assert.equal(calls, 1);
+  assert.equal((await readManifest(f.cwd)).files[0].synced.version, "2");
+});
+test("ignore still downloads missing files and preserves remote-change safety", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const entry = (await readManifest(f.cwd)).files[0];
+  await unlink(path.join(f.cwd, entry.localPath));
+  const result = await f.client.sync({ cwd: f.cwd, ignore: "1m" });
+  assert.deepEqual(result.errors, []);
+  assert.equal(f.downloads.length, 2);
+  f.versions.set("A", { version: "2" });
+  await f.client.fetch({ cwd: f.cwd });
+  const original = f.downloader.download;
+  f.downloader.download = async (...args) => {
+    await original(...args);
+    f.versions.set("A", { version: "3" });
+  };
+  const changed = await f.client.sync({ cwd: f.cwd, ignore: "1m" });
+  assert.equal(changed.errors.length, 1);
+  assert.equal((await readManifest(f.cwd)).files[0].synced.version, "1");
+  assert.equal((await readManifest(f.cwd)).files[0].remote.version, "3");
+});
+test("stale or future successful timestamps always refresh API metadata", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  let calls = 0;
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return original(key);
+  };
+  for (const date of [
+    new Date(Date.now() - 120_000).toISOString(),
+    new Date(Date.now() + 120_000).toISOString(),
+  ]) {
+    await withManifest(f.cwd, async (m) => {
+      m.files[0].remote.lastSuccessfulCheckedAt = date;
+    });
+    await f.client.fetch({ cwd: f.cwd, ignore: "1m" });
+  }
+  assert.equal(calls, 2);
+});
+test("failed checks never advance last successful check or suppress retries", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  const previous = (await readManifest(f.cwd)).files[0].remote
+    .lastSuccessfulCheckedAt;
+  f.versions.set("A", new FigmaApiError(404, "inaccessible"));
+  await f.client.fetch({ cwd: f.cwd });
+  assert.equal(
+    (await readManifest(f.cwd)).files[0].remote.lastSuccessfulCheckedAt,
+    previous,
+  );
+  let calls = 0;
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return original(key);
+  };
+  await f.client.fetch({ cwd: f.cwd, ignore: "4h" });
+  assert.equal(calls, 1);
+  assert.equal(
+    (await readManifest(f.cwd)).files[0].remote.lastSuccessfulCheckedAt,
+    previous,
+  );
+});
+test("folder cache retains successful subfolder discovery while pending files retry", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Root",
+    files: [{ key: "A", name: "A" }],
+    folders: [{ id: "456", name: "Child" }],
+  });
+  f.listings.set("456", { name: "Child", files: [], folders: [] });
+  const native = f.downloader.download;
+  f.downloader.download = async () => {
+    throw new Error("offline");
+  };
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  f.downloader.download = native;
+  let folderCalls = 0;
+  const original = f.api.folder;
+  f.api.folder = async (id) => {
+    folderCalls++;
+    return original(id);
+  };
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+    ignore: "4h",
+  });
+  assert.equal(folderCalls, 0);
+  assert.equal(f.downloads.length, 1);
+  assert.equal(
+    (await readManifest(path.join(f.cwd, "root", "Child"))).folder.id,
+    "456",
+  );
+});
+test("listing timestamp alone cannot cache incomplete per-file metadata", async (t) => {
+  const f = await fixture(t);
+  f.listings.set("123", {
+    name: "Root",
+    files: [{ key: "A", name: "A" }],
+    folders: [],
+  });
+  f.versions.set("A", new Error("metadata unavailable"));
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  const file = (await readManifest(path.join(f.cwd, "root"))).files[0];
+  assert.equal(file.remote.lastSuccessfulCheckedAt, undefined);
+  f.versions.set("A", { version: "1" });
+  let calls = 0;
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return original(key);
+  };
+  await f.client.fetch({ cwd: f.cwd, ignore: "4h" });
+  assert.equal(calls, 1);
+  assert.equal(f.downloads.length, 0);
+});
+test("legacy metadata without success marker is refreshed once", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  await withManifest(f.cwd, async (m) => {
+    delete m.files[0].remote.lastSuccessfulCheckedAt;
+    delete m.files[0].remote.editorType;
+  });
+  let calls = 0;
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return original(key);
+  };
+  await f.client.fetch({ cwd: f.cwd, ignore: "1m" });
+  await f.client.fetch({ cwd: f.cwd, ignore: "1m" });
+  assert.equal(calls, 1);
+});
+
+test("fresh remote check is durable before native download starts even when download fails", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  f.versions.set("A", { version: "2" });
+  f.downloader.download = async () => {
+    const disk = await readManifest(f.cwd);
+    assert.equal(disk.files[0].remote.version, "2");
+    assert.ok(disk.files[0].remote.lastSuccessfulCheckedAt);
+    assert.equal(disk.files[0].synced.version, "1");
+    throw new Error("power loss simulation");
+  };
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.errors.length, 1);
+  assert.equal((await readManifest(f.cwd)).files[0].remote.version, "2");
+});
+test("failed post-download validation never advances local sync baseline", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  f.versions.set("A", { version: "2" });
+  await f.client.fetch({ cwd: f.cwd });
+  const native = f.downloader.download;
+  f.downloader.download = async (...args) => {
+    await native(...args);
+    f.versions.set("A", new Error("API offline after transfer"));
+  };
+  const result = await f.client.sync({ cwd: f.cwd, ignore: "10m" });
+  assert.equal(result.errors.length, 1);
+  const m = await readManifest(f.cwd);
+  assert.equal(m.files[0].synced.version, "1");
+  assert.equal(m.files[0].remote.version, "2");
+});

@@ -130,6 +130,8 @@ Options:
 - `--json`: structured results for add/fetch/sync/auth status/logout. Interactive login and browser installation are not JSON operations.
 - `--headed` or `--no-headless`: show Chromium while downloading, e.g. `figma-files-sync add <url> --no-headless`.
 - `--concurrency 2`: up to two download tabs in one Chromium; accepts 1–3, default 1.
+- `--api-concurrency 2`: up to two concurrent API operations, independently of browser tabs; accepts 1–3, default 1. Applies to discovery and the version checks around native downloads.
+- `--ignore 10m`: reuse successful API observations from the last 10 minutes. Accepts positive durations with `s`, `m`, `h` or `d`, e.g. `30s`, `1m`, `30m`, `4h`. Pending/missing downloads are **not** skipped.
 - `--timeout 300`: editor/download timeout in seconds.
 - `--auth-dir <directory>`: override the credential directory.
 
@@ -215,7 +217,8 @@ The npm package includes `figma-files-sync/manifest.schema.json`. Runtime valida
 - Locally modified files become conflicts. `--force` preserves a sibling `.fig.backup-<id>` before replacing them.
 - One Chromium process and one authenticated context are reused per client/CLI execution. A bounded pool reuses editor tabs; successful downloads leave the Figma editor loaded, rather than navigating to a blank page. Failed tabs are discarded without restarting the whole browser.
 - When a visible same-tab link to the next document already exists in the Figma UI, the downloader clicks it so Figma can use its own client-side navigation. Otherwise it falls back to normal document navigation in the same tab. It never fakes `pushState`, sends synthetic router events or uses undocumented router internals. **Same-tab reuse does not guarantee SPA navigation**: Figma controls how each link loads, and cross-document navigation may still reload the application. Logs distinguish these paths.
-- Downloads are sequential by default. Use `--concurrency 2` or `--concurrency 3` to overlap editor loads/transfers in separate tabs of that same browser, e.g. `figma-files-sync sync --concurrency 2 --no-headless`. Folder traversal remains sequential and metadata fetch-only runs stay sequential.
+- Downloads are sequential by default. Use `--concurrency 2` or `--concurrency 3` to overlap editor loads/transfers in separate tabs of that same browser, e.g. `figma-files-sync sync --concurrency 2 --no-headless`. The API producer and native-download consumers run independently: pending files enter the browser queue immediately, while metadata checks and recursive folder discovery continue. This uses asynchronous I/O in one Node process, not worker threads.
+- Discovery looks ahead into a bounded download backlog (high-water mark 32, plus at most the in-flight metadata producers). When it fills, discovery pauses until a download settles instead of consuming unbounded memory. A retry/rate-limit wait occupies its API slot but does not pause a browser transfer already in progress. Browser jobs still require before/after API version checks, which may themselves wait on rate limits. Folder traversal remains sequential, but it no longer waits for that folder’s downloads to finish.
 - Editor starts are staggered by at least 10 seconds even in concurrent mode; this is not a bypass for Figma rate limits. Parallel tabs increase RAM usage and may trigger anti-automation safeguards: reduce concurrency if downloads fail.
 - Manifest and browser-session writes are serialized so concurrent workers cannot commit stale snapshots over newer ones. Directory locks remain held until all workers settle. The browser closes only when the client closes / CLI operation finishes (separate CLI invocations do not share a background browser).
 - Native downloads are staged beside the destination, checked for empty/error responses, then renamed. This is not full validation of Figma’s proprietary format.
@@ -225,11 +228,31 @@ The npm package includes `figma-files-sync/manifest.schema.json`. Runtime valida
 - Explicit independent destinations can maintain intentional copies; there is no hidden global registry.
 - Recursive scans skip hidden directories, `node_modules`, `dist` and `coverage`, and do not follow directory symlinks.
 
-Manifests are written atomically and saved as work completes. Each operation locks its directory with `.sync.fig.lock`. After a crash, **verify the previous process has stopped** before removing that lock. Never replace a damaged manifest with an empty one: repair or restore it. Staged files left by abrupt interruption can be removed after verifying no operation is active.
+Manifests are written atomically and saved as work completes. Each operation locks its directory with `.sync.fig.lock`. On SIGINT/SIGTERM and fatal errors, the CLI aborts cooperative work, drains its queues, closes browser resources and releases its owned locks. SIGKILL, power loss and unrecoverable runtime crashes cannot guarantee cleanup; recovery is described below. Never replace a damaged manifest with an empty one: repair or restore it. Staged files left by abrupt interruption can be removed after verifying no operation is active.
 
 File replacement and manifest commit are separate filesystem operations: a crash between them is conservatively reported as a local conflict on the next run.
 
 There is no upload, two-way merge, automatic pruning, background watcher or legacy `files.json` migration.
+
+## Retry without repeating recent API checks
+
+For an interrupted synchronization:
+
+```sh
+figma-files-sync sync --ignore 10m
+# Independent API/browser limits still apply:
+figma-files-sync sync --ignore 30m --api-concurrency 2 --concurrency 1
+```
+
+The window is measured from the **last successful API check**, not from process startup, a download attempt, or a cache hit. Successful metadata is checkpointed atomically before local hashing and download enqueueing. A failed download leaves remote version and successful-check time intact, but does not advance `synced`. A new process therefore retries the pending download using known remote metadata instead of repeating discovery.
+
+File metadata stores `remote.lastSuccessfulCheckedAt` and `remote.editorType` alongside the existing `checkedAt` (latest observed attempt/result). Folder listings store `folder.lastFetchedAt` and `folder.subfolders`, allowing child traversal to resume even when the folder-listing API call is skipped. A listing alone does not certify per-file metadata. Old manifests lacking these optional cache fields are refreshed once; failures, unavailable documents, incomplete metadata and future timestamps never qualify as fresh successful cache entries. Cache hits never extend timestamps.
+
+**Safety:** the optional cache skips discovery/per-file planning calls and a recent pre-download version check. The post-download API version check is always performed before committing a successful native download. A changed version, failed confirmation or interrupted transfer leaves `synced` untouched for retry. This intentionally means pending downloads may still make a validation API request; `--ignore` is not an offline or unverified-download mode. While using cached folder listings, newly created remote entries will not be discovered until the window expires (omit `--ignore` to refresh immediately).
+
+After abrupt process termination, lock recovery remains explicit: verify that no previous process is active before removing its `.sync.fig.lock`. Inspect with `figma-files-sync locks list [directory]` (recursive; `--no-recursive` limits the scan). Errors print the absolute lock path, owner and quoted inspection/recovery commands. Use `figma-files-sync locks clear "directory"` for a proven stale same-host lock, or `--recover-locks` on add/fetch/sync to recover those automatically. Unknown/legacy locks require manual verification and `locks clear "directory" --force`. Active local PIDs are never bypassed, even with force; PID reuse is treated conservatively. Locks on another host cannot be verified using local process state. Recovery compares the lock identity before deletion, and normal cleanup only removes its own owner token. Cached metadata does not bypass locks or local-edit conflict protection. Queues are in memory, but pending work is reconstructed from persisted remote/synced state rather than lost with the process.
+
+In the library, use `client.sync({ cwd, ignore: "10m" })` (or a client-level `ignore` default). Per-operation options override the client default. No cache window is applied unless explicitly requested.
 
 ## TypeScript library
 

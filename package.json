@@ -1,6 +1,6 @@
 {
   "name": "figma-files-sync",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Keep native Figma files synchronized locally with their source documents.",
   "type": "module",
   "bin": {
@@ -19,6 +19,7 @@
     "dist",
     "schemas",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

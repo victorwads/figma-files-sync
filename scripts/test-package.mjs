@@ -51,7 +51,9 @@ try {
   for (const file of info.files) {
     if (
       !["dist/", "schemas/"].some((prefix) => file.path.startsWith(prefix)) &&
-      !["package.json", "README.md", "LICENSE"].includes(file.path)
+      !["package.json", "README.md", "CHANGELOG.md", "LICENSE"].includes(
+        file.path,
+      )
     )
       throw new Error("Unexpected packaged file: " + file.path);
   }

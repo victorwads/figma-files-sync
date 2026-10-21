@@ -1,5 +1,7 @@
 export { createFigmaSync, FigmaSync, planFile } from "./sync.js";
 export type { ProgressEvent, ProgressReporter } from "./progress.js";
+export { listLocks, inspectLock, clearLock } from "./locks.js";
+export type { LockInfo } from "./locks.js";
 export type {
   ClientOptions,
   RunOptions,

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ProgressReporter } from "./progress.js";
 
 export class FigmaApiError extends Error {
@@ -61,6 +62,7 @@ export class RestFigmaApi implements FigmaApi {
     private readonly token: string,
     private readonly request: typeof fetch = fetch,
     private readonly onProgress?: ProgressReporter,
+    private readonly signal?: AbortSignal,
   ) {}
   private async get(endpoint: string): Promise<unknown> {
     if (!this.token)
@@ -77,7 +79,10 @@ export class RestFigmaApi implements FigmaApi {
       });
       const response = await this.request("https://api.figma.com" + endpoint, {
         headers: { "X-FIGMA-TOKEN": this.token },
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(30_000),
+          ...(this.signal ? [this.signal] : []),
+        ]),
         redirect: "error",
       });
       this.onProgress?.({
@@ -103,9 +108,9 @@ export class RestFigmaApi implements FigmaApi {
             "s before retry",
         });
         await response.body?.cancel();
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.max(1000 * retry, 1000 * (attempt + 1))),
-        );
+        await delay(Math.max(1000 * retry, 1000 * (attempt + 1)), undefined, {
+          signal: this.signal,
+        });
         continue;
       }
       await response.body?.cancel();

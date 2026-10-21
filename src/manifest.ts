@@ -1,3 +1,4 @@
+import { acquireLock } from "./locks.js";
 import { z } from "zod";
 import { randomUUID, createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -49,6 +50,7 @@ export const manifestSchema = z
         url,
         name: z.string(),
         lastFetchedAt: date.optional(),
+        subfolders: z.array(z.object({ id, name: z.string() })).optional(),
       })
       .nullable(),
     files: z.array(
@@ -62,6 +64,8 @@ export const manifestSchema = z
             version: z.string().nullable(),
             modifiedAt: date.nullable(),
             checkedAt: date,
+            lastSuccessfulCheckedAt: date.optional(),
+            editorType: z.string().optional(),
             availability: z.enum(["available", "unavailable"]),
             membership: z.enum(["present", "absent"]).optional(),
           })
@@ -221,37 +225,45 @@ export async function saveManifest(
     if (manifestWrites.get(key) === write) manifestWrites.delete(key);
   }
 }
-export async function withManifest<T>(
+/** Hold ownership while API production and download consumers share the same in-memory manifest. */
+export async function acquireManifest(
   directory: string,
-  action: (manifest: Manifest) => Promise<T>,
-): Promise<T> {
+  recoverLocks = false,
+): Promise<{ manifest: Manifest; release(): Promise<void> }> {
   await ensureDirectory(directory);
-  const lock = path.join(directory, ".sync.fig.lock");
-  try {
-    await createExclusive(
-      lock,
-      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST")
-      throw new Error(
-        "Directory is locked: " +
-          directory +
-          ". If a previous process crashed, verify it stopped before removing .sync.fig.lock.",
-      );
-    throw error;
-  }
+  const unlock = await acquireLock(directory, recoverLocks);
   try {
     const manifest = await loadManifest(directory);
     const before = JSON.stringify(manifest);
-    try {
-      return await action(manifest);
-    } finally {
-      if (JSON.stringify(manifest) !== before)
-        await saveManifest(directory, manifest);
-    }
+    let released = false;
+    return {
+      manifest,
+      async release() {
+        if (released) return;
+        released = true;
+        try {
+          if (JSON.stringify(manifest) !== before)
+            await saveManifest(directory, manifest);
+        } finally {
+          await unlock();
+        }
+      },
+    };
+  } catch (error) {
+    await unlock();
+    throw error;
+  }
+}
+export async function withManifest<T>(
+  directory: string,
+  action: (manifest: Manifest) => Promise<T>,
+  recoverLocks = false,
+): Promise<T> {
+  const lease = await acquireManifest(directory, recoverLocks);
+  try {
+    return await action(lease.manifest);
   } finally {
-    await unlink(lock);
+    await lease.release();
   }
 }
 export async function hashFile(

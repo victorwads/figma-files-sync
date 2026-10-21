@@ -61,6 +61,32 @@ export class ResourcePool<T> {
     await Promise.all(resources.map((resource) => this.discard(resource)));
   }
 }
+/** Independent async work lane. Waiting for another lane never consumes one of these slots. */
+export class TaskQueue {
+  private active = 0;
+  private waiters: (() => void)[] = [];
+  constructor(private readonly limit: number) {
+    if (!Number.isInteger(limit) || limit < 1)
+      throw new Error("Queue limit must be a positive integer.");
+  }
+  get running(): number {
+    return this.active;
+  }
+  get waiting(): number {
+    return this.waiters.length;
+  }
+  async run<T>(action: () => Promise<T>): Promise<T> {
+    if (this.active < this.limit) this.active++;
+    else await new Promise<void>((resolve) => this.waiters.push(resolve));
+    try {
+      return await action();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
 /** Promise-tail mutex. Rejections do not poison later jobs. */
 export function serialQueue(): <T>(action: () => Promise<T>) => Promise<T> {
   let tail: Promise<unknown> = Promise.resolve();

@@ -165,3 +165,39 @@ test("data commands reject malformed manifests without altering them", async (t)
     "invalid",
   );
 });
+
+test("api-concurrency accepts an independent limit and rejects invalid values", async (t) => {
+  const f = await fixture(t);
+  let r = f.run(
+    "fetch",
+    "--api-concurrency",
+    "2",
+    "--concurrency",
+    "1",
+    "--json",
+  );
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), { items: [], errors: [] });
+  for (const value of ["0", "4", "abc", "1.5"]) {
+    r = f.run("fetch", "--api-concurrency", value);
+    assert.notEqual(r.status, 0);
+  }
+});
+
+test("ignore durations work before/after subcommands and fail fast when invalid", async (t) => {
+  const f = await fixture(t);
+  for (const args of [
+    ["--ignore", "1m", "fetch", "--json"],
+    ["sync", "--ignore", "4h", "--json"],
+    ["fetch", "--ignore", "30m", "--json"],
+  ]) {
+    const r = f.run(...args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), { items: [], errors: [] });
+  }
+  for (const value of ["5", "0m", "abc", "-2h"]) {
+    const r = f.run("fetch", "--ignore", value);
+    assert.notEqual(r.status, 0);
+  }
+  assert.deepEqual(await readdir(f.cwd), []);
+});

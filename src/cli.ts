@@ -12,6 +12,9 @@ import { RestFigmaApi } from "./api.js";
 import { createFigmaSync, type SyncResult } from "./sync.js";
 import { createProgressLogger } from "./progress.js";
 import { concurrencyLimit } from "./concurrency.js";
+import { parseDuration } from "./freshness.js";
+import { listLocks, clearLock } from "./locks.js";
+import { installShutdown } from "./shutdown.js";
 
 function positiveNumber(value: string): number {
   const n = Number(value);
@@ -84,6 +87,10 @@ program
     ).version,
   )
   .option("--json", "Print machine-readable results")
+  .option(
+    "--recover-locks",
+    "Recover only same-host locks whose process exited; never bypass live locks",
+  )
   .option("--auth-dir <path>", "Override credential directory")
   .option("--headed", "Show the download browser")
   .option("--no-headless", "Show Chromium (alias for --headed)")
@@ -92,6 +99,20 @@ program
     "Active download tabs in one Chromium (1–3; default 1)",
     (value) => concurrencyLimit(Number(value)),
     1,
+  )
+  .option(
+    "--api-concurrency <requests>",
+    "Concurrent API operations, independent from download tabs (1–3; default 1)",
+    (value) => concurrencyLimit(Number(value)),
+    1,
+  )
+  .option(
+    "--ignore <duration>",
+    "Reuse successful API checks newer than this duration, not downloads (e.g. 1m, 30m, 4h)",
+    (value) => {
+      parseDuration(value);
+      return value;
+    },
   )
   .option(
     "--timeout <seconds>",
@@ -111,6 +132,10 @@ async function execute(
   const opts = program.opts();
   const progress = createProgressLogger((line) => console.error(line));
   const started = Date.now();
+  const controller = new AbortController();
+  const removeShutdown = installShutdown(controller, (message) =>
+    console.error(message),
+  );
   progress.report({
     phase: "manifest",
     message: "Starting operation in " + process.cwd(),
@@ -119,6 +144,10 @@ async function execute(
     authDirectory: opts.authDir,
     headed: opts.headed || opts.headless === false,
     concurrency: opts.concurrency,
+    apiConcurrency: opts.apiConcurrency,
+    ignore: opts.ignore,
+    recoverLocks: opts.recoverLocks,
+    signal: controller.signal,
     onProgress: progress.report,
     onEvent: opts.json
       ? undefined
@@ -170,6 +199,7 @@ async function execute(
       await client.close();
     } finally {
       progress.stop();
+      removeShutdown();
     }
   }
 }
@@ -318,6 +348,56 @@ program
         "Saved credentials removed. Environment variables are unchanged.",
       );
   });
+const locks = program
+  .command("locks")
+  .description("Inspect/recover locks without changing manifests");
+locks
+  .command("list [directory]")
+  .description("List locks recursively with PID, host and liveness")
+  .option("--no-recursive", "Inspect only this directory")
+  .action(
+    async (directory: string | undefined, opts: { recursive: boolean }) => {
+      const found = await listLocks(
+        path.resolve(directory ?? "."),
+        opts.recursive,
+      );
+      if (program.opts().json) print(found);
+      else if (!found.length) console.log("No locks found.");
+      else
+        for (const lock of found)
+          console.log(
+            lock.state.toUpperCase() +
+              " " +
+              lock.path +
+              " — PID " +
+              (lock.pid ?? "?") +
+              ", host " +
+              (lock.host ?? "unknown") +
+              ": " +
+              lock.reason,
+          );
+    },
+  );
+locks
+  .command("clear [directory]")
+  .description("Remove a proven stale lock in exactly one directory")
+  .option(
+    "--force",
+    "Remove unknown/legacy/foreign-host lock after checking its owner manually; active local PIDs remain blocked",
+  )
+  .action(async (directory: string | undefined, opts: { force?: boolean }) => {
+    const removed = await clearLock(
+      path.resolve(directory ?? "."),
+      !!opts.force,
+    );
+    if (program.opts().json) print({ removed });
+    else
+      console.log(
+        removed
+          ? "Lock removed. No manifests or native files were changed."
+          : "No lock present.",
+      );
+  });
 const authCommand = program
   .command("auth")
   .description("Inspect authentication configuration");
@@ -350,5 +430,5 @@ try {
   const message = error instanceof Error ? error.message : "Command failed.";
   if (program.opts().json) print({ error: message });
   else console.error("Error: " + message);
-  process.exitCode = 1;
+  process.exitCode ||= 1;
 }

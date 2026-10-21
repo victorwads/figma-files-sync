@@ -6,6 +6,7 @@ import {
   type Page,
 } from "playwright";
 import { open } from "node:fs/promises";
+import { setTimeout as waitDelay } from "node:timers/promises";
 import { AuthStore, addAuthCookie } from "./auth.js";
 import type { ProgressReporter } from "./progress.js";
 import { navigateToFile } from "./navigation.js";
@@ -16,6 +17,7 @@ export interface NativeDownloader {
 }
 export interface DownloadOptions {
   headed?: boolean;
+  signal?: AbortSignal;
   /** Maximum active editor tabs (1–3). */
   concurrency?: number;
   timeoutMs?: number;
@@ -86,91 +88,105 @@ export class PlaywrightDownloader implements NativeDownloader {
   }
   async download(key: string, destination: string): Promise<void> {
     const context = await this.ready();
+    this.options.signal?.throwIfAborted();
     await this.tabs!.use(async (page) => {
-      this.options.onProgress?.({
-        phase: "browser",
-        message: "Using shared Chromium tab for " + key,
-      });
-      await this.starts(async () => {
-        const delay = this.nextStart - Date.now();
-        if (delay > 0) {
+      this.options.signal?.throwIfAborted();
+      const abort = () => {
+        void page.close().catch(() => {});
+      };
+      this.options.signal?.addEventListener("abort", abort, { once: true });
+      try {
+        this.options.signal?.throwIfAborted();
+        this.options.onProgress?.({
+          phase: "browser",
+          message: "Using shared Chromium tab for " + key,
+        });
+        await this.starts(async () => {
+          const delay = this.nextStart - Date.now();
+          if (delay > 0) {
+            this.options.onProgress?.({
+              phase: "download",
+              message:
+                "Waiting " +
+                Math.ceil(delay / 1000) +
+                "s before opening editor for " +
+                key,
+            });
+            await waitDelay(delay, undefined, { signal: this.options.signal });
+          }
+          this.nextStart =
+            Date.now() + Math.max(10_000, this.options.delayMs ?? 10_000);
+        });
+        const timeout = this.options.timeoutMs ?? 180_000;
+        page.setDefaultTimeout(timeout);
+        try {
+          this.options.onProgress?.({
+            phase: "browser",
+            message:
+              "Opening Figma editor for " +
+              key +
+              " (timeout " +
+              Math.round(timeout / 1000) +
+              "s)",
+          });
+          await navigateToFile(page, key, timeout, this.options.onProgress);
+          if (/\/(login|signup)(?:\/|$)/.test(new URL(page.url()).pathname))
+            throw new Error(
+              "Browser session expired. Run figma-files-sync login.",
+            );
+          await page
+            .getByRole("button", { name: "Close", exact: true })
+            .click({ timeout: 2000 })
+            .catch(() => {});
+          this.options.onProgress?.({
+            phase: "browser",
+            message: "Waiting for editor / opening File menu for " + key,
+          });
+          await page.locator("[data-tooltip='main-menu']").click();
+          await page.locator("[aria-controls^='mainMenu.file-menu']").click();
+          const action = page.getByText("Save local copy…", { exact: true });
           this.options.onProgress?.({
             phase: "download",
             message:
-              "Waiting " +
-              Math.ceil(delay / 1000) +
-              "s before opening editor for " +
-              key,
+              "Requesting Save local copy; waiting for Figma to generate " +
+              key +
+              ".fig",
           });
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          const [download] = await Promise.all([
+            page.waitForEvent("download", { timeout }),
+            action.click(),
+          ]);
+          if (!download.suggestedFilename().toLowerCase().endsWith(".fig"))
+            throw new Error(
+              "Figma returned a non-.fig document; only Figma Design is supported.",
+            );
+          this.options.onProgress?.({
+            phase: "download",
+            message:
+              "Download started for " +
+              key +
+              "; waiting for transfer to finish",
+          });
+          await download.saveAs(destination);
+          if (await download.failure())
+            throw new Error("Figma native download failed.");
+          this.options.onProgress?.({
+            phase: "download",
+            message: "Transfer finished; validating native file for " + key,
+          });
+          await verifyNativeFile(destination);
+          await this.sessionWrites(() => this.auth.saveSession(context));
+          this.options.signal?.throwIfAborted();
+          // Preserve the Figma app in this tab between files instead of unloading it.
+        } catch (error) {
+          if (error instanceof Error && error.name === "TimeoutError")
+            throw new Error(
+              "Figma UI/download timed out. Check session, export permissions, desktop-app link settings, or retry with --headed / --timeout. No export restrictions are bypassed.",
+            );
+          throw error;
         }
-        this.nextStart =
-          Date.now() + Math.max(10_000, this.options.delayMs ?? 10_000);
-      });
-      const timeout = this.options.timeoutMs ?? 180_000;
-      page.setDefaultTimeout(timeout);
-      try {
-        this.options.onProgress?.({
-          phase: "browser",
-          message:
-            "Opening Figma editor for " +
-            key +
-            " (timeout " +
-            Math.round(timeout / 1000) +
-            "s)",
-        });
-        await navigateToFile(page, key, timeout, this.options.onProgress);
-        if (/\/(login|signup)(?:\/|$)/.test(new URL(page.url()).pathname))
-          throw new Error(
-            "Browser session expired. Run figma-files-sync login.",
-          );
-        await page
-          .getByRole("button", { name: "Close", exact: true })
-          .click({ timeout: 2000 })
-          .catch(() => {});
-        this.options.onProgress?.({
-          phase: "browser",
-          message: "Waiting for editor / opening File menu for " + key,
-        });
-        await page.locator("[data-tooltip='main-menu']").click();
-        await page.locator("[aria-controls^='mainMenu.file-menu']").click();
-        const action = page.getByText("Save local copy…", { exact: true });
-        this.options.onProgress?.({
-          phase: "download",
-          message:
-            "Requesting Save local copy; waiting for Figma to generate " +
-            key +
-            ".fig",
-        });
-        const [download] = await Promise.all([
-          page.waitForEvent("download", { timeout }),
-          action.click(),
-        ]);
-        if (!download.suggestedFilename().toLowerCase().endsWith(".fig"))
-          throw new Error(
-            "Figma returned a non-.fig document; only Figma Design is supported.",
-          );
-        this.options.onProgress?.({
-          phase: "download",
-          message:
-            "Download started for " + key + "; waiting for transfer to finish",
-        });
-        await download.saveAs(destination);
-        if (await download.failure())
-          throw new Error("Figma native download failed.");
-        this.options.onProgress?.({
-          phase: "download",
-          message: "Transfer finished; validating native file for " + key,
-        });
-        await verifyNativeFile(destination);
-        await this.sessionWrites(() => this.auth.saveSession(context));
-        // Preserve the Figma app in this tab between files instead of unloading it.
-      } catch (error) {
-        if (error instanceof Error && error.name === "TimeoutError")
-          throw new Error(
-            "Figma UI/download timed out. Check session, export permissions, desktop-app link settings, or retry with --headed / --timeout. No export restrictions are bypassed.",
-          );
-        throw error;
+      } finally {
+        this.options.signal?.removeEventListener("abort", abort);
       }
     });
   }
