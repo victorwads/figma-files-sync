@@ -1226,3 +1226,293 @@ test("failed post-download validation never advances local sync baseline", async
   assert.equal(m.files[0].synced.version, "1");
   assert.equal(m.files[0].remote.version, "2");
 });
+
+const listedDate = "2026-10-19T10:00:00Z";
+const changedListedDate = "2026-10-19T11:00:00Z";
+async function listingFixture(t, options = {}) {
+  const f = await fixture(t, options);
+  const calls = [];
+  const original = f.api.file;
+  f.api.file = async (key) => {
+    calls.push(key);
+    return original(key);
+  };
+  f.listings.set("123", {
+    name: "Root",
+    files: [{ key: "A", name: "A", modifiedAt: listedDate }],
+    folders: [],
+  });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  calls.length = 0;
+  return { ...f, calls, dir: path.join(f.cwd, "root") };
+}
+test("folder dates eliminate all per-file API calls on an unchanged sync without ignore", async (t) => {
+  const f = await listingFixture(t);
+  const before = await readManifest(f.dir);
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.items[0].status, "unchanged");
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.downloads.length, 1);
+  const file = (await readManifest(f.dir)).files[0];
+  assert.equal(file.listing.modifiedAt, new Date(listedDate).toISOString());
+  assert.equal(file.remote.modifiedAt, date);
+  assert.equal(
+    file.remote.lastSuccessfulCheckedAt,
+    before.files[0].remote.lastSuccessfulCheckedAt,
+  );
+});
+test("changed listing overrides fresh ignore metadata and only queries the changed file", async (t) => {
+  const f = await listingFixture(t);
+  f.versions.set("A", { version: "2" });
+  f.listings.get("123").files[0].modifiedAt = changedListedDate;
+  await withManifest(f.dir, async (m) => {
+    m.folder.lastFetchedAt = "2000-01-01T00:00:00Z";
+  });
+  const result = await f.client.sync({ cwd: f.cwd, ignore: "30m" });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.items[0].status, "downloaded");
+  assert.deepEqual(f.calls, ["A", "A"]);
+  assert.equal((await readManifest(f.dir)).files[0].synced.version, "2");
+});
+test("fetch of changed listing persists pending version and retry downloads despite identical listing", async (t) => {
+  const f = await listingFixture(t);
+  f.versions.set("A", { version: "2" });
+  f.listings.get("123").files[0].modifiedAt = changedListedDate;
+  const fetched = await f.client.fetch({ cwd: f.cwd });
+  assert.equal(fetched.items[0].status, "modified");
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal((await readManifest(f.dir)).files[0].synced.version, "1");
+  f.calls.length = 0;
+  const native = f.downloader.download;
+  f.downloader.download = async () => {
+    throw Error("offline");
+  };
+  const failed = await f.client.sync({ cwd: f.cwd });
+  assert.equal(failed.errors.length, 1);
+  assert.deepEqual(f.calls, []);
+  f.downloader.download = native;
+  const resumed = createFigmaSync({ api: f.api, downloader: f.downloader });
+  try {
+    const result = await resumed.sync({ cwd: f.cwd, ignore: "30m" });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.items[0].status, "downloaded");
+  } finally {
+    await resumed.close();
+  }
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal((await readManifest(f.dir)).files[0].synced.version, "2");
+});
+test("unchanged listing still checks local edits and downloads missing native files", async (t) => {
+  const f = await listingFixture(t);
+  const file = (await readManifest(f.dir)).files[0];
+  const target = path.join(f.dir, file.localPath);
+  await writeFile(target, "local edits");
+  const conflict = await f.client.sync({ cwd: f.cwd });
+  assert.equal(conflict.items[0].status, "conflict");
+  assert.deepEqual(f.calls, []);
+  await unlink(target);
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.items[0].status, "downloaded");
+  assert.deepEqual(f.calls, ["A"]);
+});
+test("first observation of legacy metadata bootstraps listing baseline without downloading again", async (t) => {
+  const f = await listingFixture(t);
+  await withManifest(f.dir, async (m) => {
+    delete m.files[0].listing;
+  });
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal(f.downloads.length, 1);
+  f.calls.length = 0;
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, []);
+});
+test("listing without date falls back to metadata and never reuses an obsolete hint", async (t) => {
+  const f = await listingFixture(t);
+  delete f.listings.get("123").files[0].modifiedAt;
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal((await readManifest(f.dir)).files[0].listing, undefined);
+});
+test("failed metadata for a changed listing must be retried even when list date stays equal", async (t) => {
+  const f = await listingFixture(t);
+  f.listings.get("123").files[0].modifiedAt = changedListedDate;
+  f.versions.set("A", new Error("API unavailable"));
+  const failed = await f.client.fetch({ cwd: f.cwd });
+  assert.equal(failed.errors.length, 1);
+  const entry = (await readManifest(f.dir)).files[0];
+  assert.equal(entry.listing.metadataVersion, undefined);
+  f.calls.length = 0;
+  f.versions.set("A", { version: "2" });
+  const result = await f.client.sync({ cwd: f.cwd, ignore: "30m" });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(f.calls, ["A", "A"]);
+  assert.equal((await readManifest(f.dir)).files[0].synced.version, "2");
+});
+test("change detected after download invalidates list pairing and preserves successful baseline", async (t) => {
+  const f = await listingFixture(t);
+  f.versions.set("A", { version: "2" });
+  f.listings.get("123").files[0].modifiedAt = changedListedDate;
+  const native = f.downloader.download;
+  f.downloader.download = async (...args) => {
+    await native(...args);
+    f.versions.set("A", { version: "3" });
+  };
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.errors.length, 1);
+  const entry = (await readManifest(f.dir)).files[0];
+  assert.equal(entry.synced.version, "1");
+  assert.equal(entry.remote.version, "3");
+  assert.equal(entry.listing.metadataVersion, undefined);
+  f.downloader.download = native;
+  f.calls.length = 0;
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, ["A", "A"]);
+  assert.equal((await readManifest(f.dir)).files[0].synced.version, "3");
+});
+test("folder fast path still traverses child and grandchild folders", async (t) => {
+  const f = await listingFixture(t);
+  f.listings.get("123").folders = [{ id: "456", name: "Child" }];
+  f.listings.set("456", {
+    name: "Child",
+    files: [],
+    folders: [{ id: "789", name: "Grandchild" }],
+  });
+  f.listings.set("789", {
+    name: "Grandchild",
+    files: [{ key: "B", name: "B", modifiedAt: listedDate }],
+    folders: [],
+  });
+  await f.client.sync({ cwd: f.cwd });
+  f.calls.length = 0;
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.items.length, 2);
+  assert.deepEqual(f.calls, []);
+  f.listings.get("789").files[0].modifiedAt = changedListedDate;
+  f.versions.set("B", { version: "2" });
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, ["B", "B"]);
+});
+test("REST listing preserves normalized last_modified and safely ignores missing or invalid dates", async () => {
+  const api = new RestFigmaApi("token", async (url) =>
+    Response.json(
+      url.endsWith("/files")
+        ? {
+            files: [
+              {
+                key: "A",
+                name: "A",
+                last_modified: "2026-10-19T07:00:00-03:00",
+              },
+              { key: "B", name: "B" },
+              { key: "C", name: "C", last_modified: "invalid" },
+            ],
+          }
+        : { folders: [] },
+    ),
+  );
+  const result = await api.folder("123");
+  assert.equal(result.files[0].modifiedAt, "2026-10-19T10:00:00.000Z");
+  assert.equal(result.files[1].modifiedAt, undefined);
+  assert.equal(result.files[2].modifiedAt, undefined);
+});
+
+test("24-file four-folder scenario queries only 5 modified files and their postchecks", async (t) => {
+  const f = await fixture(t);
+  const folderIds = ["123", "456", "789", "999"];
+  const counts = [1, 8, 8, 7];
+  let index = 0;
+  for (let i = 0; i < 4; i++)
+    f.listings.set(folderIds[i], {
+      name: "Folder" + i,
+      files: Array.from({ length: counts[i] }, () => {
+        const key = "K" + index++;
+        return { key, name: key, modifiedAt: listedDate };
+      }),
+      folders:
+        i === 0
+          ? folderIds
+              .slice(1)
+              .map((id, j) => ({ id, name: "Folder" + (j + 1) }))
+          : [],
+    });
+  await f.client.add("https://figma.com/files/folder/123", {
+    cwd: f.cwd,
+    directory: "root",
+  });
+  let folders = 0;
+  const meta = [];
+  const originalFolder = f.api.folder,
+    originalFile = f.api.file;
+  f.api.folder = async (id) => {
+    folders++;
+    return originalFolder(id);
+  };
+  f.api.file = async (key) => {
+    meta.push(key);
+    return originalFile(key);
+  };
+  const unchanged = await f.client.sync({ cwd: f.cwd });
+  assert.equal(unchanged.items.length, 24);
+  assert.equal(folders, 4);
+  assert.equal(meta.length, 0);
+  const changed = new Set(["K9", "K10", "K16", "K19", "K20"]);
+  for (const listing of f.listings.values())
+    for (const file of listing.files)
+      if (changed.has(file.key)) {
+        file.modifiedAt = changedListedDate;
+        f.versions.set(file.key, { version: "2" });
+      }
+  folders = 0;
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.items.filter((x) => x.status === "downloaded").length, 5);
+  assert.equal(folders, 4);
+  assert.equal(meta.length, 10);
+  assert.ok(meta.every((key) => changed.has(key)));
+});
+test("standalone files still consult metadata on each uncached sync", async (t) => {
+  const f = await fixture(t);
+  await f.client.add("https://figma.com/design/A", { cwd: f.cwd });
+  let calls = 0;
+  const orig = f.api.file;
+  f.api.file = async (key) => {
+    calls++;
+    return orig(key);
+  };
+  await f.client.sync({ cwd: f.cwd });
+  assert.equal(calls, 1);
+});
+test("absent file listing and unavailable metadata cannot reuse a previous listing pair", async (t) => {
+  const f = await listingFixture(t);
+  f.listings.get("123").files = [];
+  f.versions.set("A", new FigmaApiError(404, "unavailable"));
+  const result = await f.client.sync({ cwd: f.cwd });
+  assert.equal(result.items[0].status, "unavailable");
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal((await readManifest(f.dir)).files[0].listing, undefined);
+});
+test("folder rename updates remote name without renaming native copy or fetching metadata", async (t) => {
+  const f = await listingFixture(t);
+  const local = (await readManifest(f.dir)).files[0].localPath;
+  f.listings.get("123").files[0].name = "Renamed";
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, []);
+  const file = (await readManifest(f.dir)).files[0];
+  assert.equal(file.name, "Renamed");
+  assert.equal(file.localPath, local);
+});
+test("future folder dates are never allowed to suppress metadata checks", async (t) => {
+  const f = await listingFixture(t);
+  f.listings.get("123").files[0].modifiedAt = new Date(
+    Date.now() + 86400000,
+  ).toISOString();
+  await f.client.sync({ cwd: f.cwd });
+  assert.deepEqual(f.calls, ["A"]);
+  assert.equal((await readManifest(f.dir)).files[0].listing, undefined);
+});

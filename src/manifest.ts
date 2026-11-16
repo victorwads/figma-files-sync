@@ -59,6 +59,16 @@ export const manifestSchema = z
         url,
         name: z.string(),
         localPath: filename,
+        // Separate clocks: folder last_modified must never be compared with last_touched_at.
+        listing: z
+          .object({
+            folderId: id,
+            modifiedAt: date,
+            checkedAt: date,
+            metadataVersion: z.string().optional(),
+            metadataModifiedAt: date.nullable().optional(),
+          })
+          .optional(),
         remote: z
           .looseObject({
             version: z.string().nullable(),

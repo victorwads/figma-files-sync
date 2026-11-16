@@ -24,7 +24,8 @@ export interface FolderInfo {
 }
 export interface FolderListing {
   name: string;
-  files: { key: string; name: string }[];
+  /** modifiedAt is the listing last_modified, not file metadata last_touched_at. */
+  files: { key: string; name: string; modifiedAt?: string }[];
   folders: FolderInfo[];
 }
 export interface FigmaApi {
@@ -43,7 +44,20 @@ const metadata = z.object({
 const filesSchema = z.object({
   name: z.string().optional(),
   files: z.array(
-    z.object({ key: z.string().regex(/^[a-zA-Z0-9_-]+$/), name: z.string() }),
+    z.object({
+      key: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+      name: z.string(),
+      // Older/custom endpoints may omit this hint. Fall back to per-file metadata.
+      last_modified: z
+        .unknown()
+        .optional()
+        .transform((value) => {
+          const parsed = z.iso.datetime({ offset: true }).safeParse(value);
+          return parsed.success
+            ? new Date(parsed.data).toISOString()
+            : undefined;
+        }),
+    }),
   ),
 });
 const folderSchema = z.object({
@@ -150,7 +164,11 @@ export class RestFigmaApi implements FigmaApi {
     );
     return {
       name: files.name ?? "Folder " + id,
-      files: files.files,
+      files: files.files.map((file) => ({
+        key: file.key,
+        name: file.name,
+        ...(file.last_modified ? { modifiedAt: file.last_modified } : {}),
+      })),
       folders: children.folders,
     };
   }

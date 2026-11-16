@@ -211,7 +211,9 @@ The npm package includes `figma-files-sync/manifest.schema.json`. Runtime valida
 
 ## Synchronization and recovery
 
-- Fetch uses lightweight metadata endpoints, not full document JSON.
+- Fetch uses lightweight metadata endpoints, not full document JSON. For registered folders, fresh listings provide per-file `last_modified`: once paired with verified metadata, an unchanged listing date avoids a separate metadata request for that file. This optimization is automatic, even without `--ignore`.
+- Listing timestamps are stored separately from metadata `last_touched_at`; older manifests establish the pairing once. Changed/new files and incomplete observations fall back to individual metadata queries. Local hashes are still checked, missing/pending downloads still run, and the post-download API confirmation remains mandatory.
+- The CLI traverses folders recursively. Each API listing contains only direct children, so every nested folder still needs its own files/subfolders listing unless `--ignore` reuses a recent one. The fast path does not skip child folders.
 - Sync compares remote version, successful-download baseline and local presence/hash.
 - Unchanged remote/local pairs cause **zero native downloads**.
 - Locally modified files become conflicts. `--force` preserves a sibling `.fig.backup-<id>` before replacing them.

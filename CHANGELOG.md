@@ -2,6 +2,13 @@
 
 All notable changes to Figma Files Sync are documented here. New features, improvements, and fixes are distinguished according to what each release actually changes.
 
+## [1.2.0] - 2026-11-15
+
+### Improvements
+
+- Use file modification dates from folder listings to skip redundant individual metadata requests when files have not changed, while retaining recursive folder discovery, local conflict checks and pending downloads.
+- Persist listing-to-metadata observations for reuse across runs; older manifests initialize them once. Keep listing timestamps distinct from file metadata timestamps and retain post-download version confirmation.
+
 ## [1.1.0] - 2026-10-21
 
 ### Features

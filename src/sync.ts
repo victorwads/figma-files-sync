@@ -283,6 +283,41 @@ export class FigmaSync {
       editorType: remote.editorType,
     };
   }
+  /** Only reuse full metadata explicitly paired with this folder-listing observation. */
+  private listingMetadata(
+    file: ManagedFile,
+    folderId: string | undefined,
+    freshlyListed: boolean,
+    ignoreMs: number,
+  ): FileMetadata | undefined {
+    const hint = file.listing;
+    const remote = file.remote;
+    if (
+      !folderId ||
+      hint?.folderId !== folderId ||
+      remote?.membership !== "present" ||
+      remote.availability !== "available" ||
+      !remote.version ||
+      !remote.editorType ||
+      hint.metadataVersion !== remote.version ||
+      hint.metadataModifiedAt !== remote.modifiedAt ||
+      (!freshlyListed && !isFresh(hint.checkedAt, ignoreMs))
+    )
+      return;
+    return {
+      key: file.key,
+      name: file.name,
+      version: remote.version,
+      modifiedAt: remote.modifiedAt,
+      editorType: remote.editorType,
+    };
+  }
+  private pairListing(file: ManagedFile): void {
+    if (file.listing && file.remote?.version) {
+      file.listing.metadataVersion = file.remote.version;
+      file.listing.metadataModifiedAt = file.remote.modifiedAt;
+    }
+  }
   private async findFolder(
     parent: string,
     id: string,
@@ -389,6 +424,7 @@ export class FigmaSync {
         );
         leases.push(lease);
         const manifest = lease.manifest;
+        let freshlyListed = false;
         {
           if (manifest.folder) {
             const folder = manifest.folder;
@@ -414,6 +450,7 @@ export class FigmaSync {
                 message: "Listing remote folder " + folder.id,
               });
               const listing = await api.folder(folder.id);
+              freshlyListed = true;
               this.options.onProgress?.({
                 phase: "discovery",
                 message:
@@ -464,6 +501,34 @@ export class FigmaSync {
                 });
                 known.set(remoteFile.key, directory);
               }
+              const listingTime = new Date().toISOString();
+              const listedFiles = new Map(
+                listing.files.map((file) => [file.key, file]),
+              );
+              for (const file of manifest.files) {
+                const entry = listedFiles.get(file.key);
+                const modified = entry?.modifiedAt;
+                if (
+                  !modified ||
+                  !Number.isFinite(Date.parse(modified)) ||
+                  Date.parse(modified) > Date.now()
+                ) {
+                  delete file.listing;
+                  continue;
+                }
+                const normalized = new Date(modified).toISOString();
+                const prior = file.listing;
+                file.listing = {
+                  ...(prior?.folderId === folder.id &&
+                  prior.modifiedAt === normalized
+                    ? prior
+                    : {}),
+                  folderId: folder.id,
+                  modifiedAt: normalized,
+                  checkedAt: listingTime,
+                };
+                if (entry) file.name = entry.name;
+              }
               folder.subfolders = listing.folders;
               folder.lastFetchedAt = new Date().toISOString();
               await saveManifest(directory, manifest);
@@ -498,9 +563,31 @@ export class FigmaSync {
               };
               try {
                 let meta: FileMetadata;
-                const cached = this.cachedMetadata(file, ignoreMs);
+                const listingMeta = this.listingMetadata(
+                  file,
+                  manifest.folder?.id,
+                  freshlyListed,
+                  ignoreMs,
+                );
+                const listingPending =
+                  file.listing?.folderId === manifest.folder?.id &&
+                  (freshlyListed ||
+                    isFresh(file.listing?.checkedAt, ignoreMs)) &&
+                  !listingMeta;
+                const cached =
+                  listingMeta ??
+                  (listingPending
+                    ? undefined
+                    : this.cachedMetadata(file, ignoreMs));
                 try {
-                  if (cached)
+                  if (listingMeta)
+                    this.options.onProgress?.({
+                      phase: "api",
+                      message:
+                        "Folder last_modified unchanged; reusing verified metadata for " +
+                        file.localPath,
+                    });
+                  else if (cached)
                     this.options.onProgress?.({
                       phase: "api",
                       message:
@@ -543,6 +630,12 @@ export class FigmaSync {
                     ...(membership ? { membership } : {}),
                   };
                 file.name = meta.name;
+                if (
+                  !cached &&
+                  file.listing?.folderId === manifest.folder?.id &&
+                  (freshlyListed || isFresh(file.listing?.checkedAt, ignoreMs))
+                )
+                  this.pairListing(file);
                 // Checkpoint remote state immediately, before hashing/enqueueing or starting native work.
                 await saveManifest(directory, manifest);
                 if (meta.editorType !== "figma") {
@@ -705,11 +798,23 @@ export class FigmaSync {
         phase: "api",
         message: "Checking remote version before download: " + file.localPath,
       });
-      const cached = this.cachedMetadata(file, ignoreMs);
+      // A just-verified listing pair avoids repeating the planning API call for queued downloads.
+      const cached =
+        this.listingMetadata(file, manifest.folder?.id, false, 30_000) ??
+        this.cachedMetadata(file, ignoreMs);
       const before = cached ?? (await api.file(file.key));
       if (!cached) {
         file.name = before.name;
         file.remote = { ...file.remote, ...this.remote(before) };
+        // A newer version than the paired observation invalidates that association.
+        if (
+          file.listing &&
+          (file.listing.metadataVersion !== before.version ||
+            file.listing.metadataModifiedAt !== before.modifiedAt)
+        ) {
+          delete file.listing.metadataVersion;
+          delete file.listing.metadataModifiedAt;
+        }
         await saveManifest(directory, manifest);
       } else
         this.options.onProgress?.({
@@ -729,6 +834,14 @@ export class FigmaSync {
       const after = await api.file(file.key);
       file.name = after.name;
       file.remote = { ...file.remote, ...this.remote(after) };
+      if (
+        file.listing &&
+        (file.listing.metadataVersion !== after.version ||
+          file.listing.metadataModifiedAt !== after.modifiedAt)
+      ) {
+        delete file.listing.metadataVersion;
+        delete file.listing.metadataModifiedAt;
+      }
       await saveManifest(directory, manifest);
       if (
         !before.version ||
